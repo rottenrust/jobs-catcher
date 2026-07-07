@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+*.pyc
+.env
+*.db
+*.sqlite*
+data/
+uploads/
+runs/
+artifacts/runs/
+
+*.egg-info/
+src/*.egg-info/
