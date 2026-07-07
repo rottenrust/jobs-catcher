@@ -1,207 +1,399 @@
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
-from fastapi import FastAPI, Form, HTTPException, Request, UploadFile, File
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, JSONResponse
+import json, shutil, uuid
+from datetime import timedelta
+from html import escape
+from pathlib import Path
 
-from . import auth, criteria, documents, export, queue, scoring
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-@dataclass
-class Store:
-    users: dict[int, dict] = field(default_factory=dict)
-    sessions: dict[str, int] = field(default_factory=dict)
-    resumes: dict[int, dict] = field(default_factory=dict)
-    profiles: dict[int, dict] = field(default_factory=dict)
-    criteria_versions: dict[int, list[dict]] = field(default_factory=dict)
-    schedules: dict[int, dict] = field(default_factory=dict)
-    vacancies: dict[int, dict] = field(default_factory=dict)
-    viewed: set[tuple[int, int]] = field(default_factory=set)
-    letters: list[dict] = field(default_factory=list)
-    audit: list[dict] = field(default_factory=list)
-    jobs: queue.JobQueue = field(default_factory=queue.JobQueue)
-    next_user: int = 1
-    next_vacancy: int = 1
-    limiter: auth.LoginRateLimiter = field(default_factory=auth.LoginRateLimiter)
+from . import auth, criteria, documents, export, queue
+from .db import bootstrap_admin, create_schema, make_engine, make_session_factory, session_expiry, utcnow
+from .models import (
+    AuditLog, BackgroundJob, CoverLetter, CriteriaVersion, LoginAttempt,
+    ProfileVersion, ResumeFile, SearchRun, SourceHealth, User, UserSchedule,
+    UserSession, Vacancy, VacancyScore, VacancySource, VacancyUIState,
+)
+from .settings import Settings, load_settings
 
-    def bootstrap(self):
-        if not self.users:
-            self.users[1] = {"id": 1, "login": "admin", "password_hash": auth.hash_password("admin"), "role": "superuser", "must_change_password": True, "deleted": False, "display_name": "Admin"}
-            self.next_user = 2
+class Store:  # compatibility shim for old tests; production uses Settings/DB only.
+    def __init__(self, database_url: str | None = None, upload_dir: Path | None = None, data_dir: Path | None = None):
+        self.settings = Settings(database_url=database_url or "sqlite:///:memory:", data_dir=data_dir or Path("data-test"), upload_dir=upload_dir or Path("data-test/uploads"), run_dir=(data_dir or Path("data-test")) / "runs", allowed_hosts=("testserver", "localhost", "127.0.0.1"))
 
+def dumps(data) -> str:
+    return json.dumps(data, ensure_ascii=False, sort_keys=True)
 
-def create_app(store: Store | None = None, *, production: bool = False) -> FastAPI:
-    store = store or Store(); store.bootstrap()
+def loads(text: str | None, default=None):
+    if not text:
+        return {} if default is None else default
+    return json.loads(text)
+
+def create_app(store: Store | None = None, *, settings: Settings | None = None, production: bool | None = None) -> FastAPI:
+    if settings is None:
+        settings = store.settings if store is not None else load_settings()
+    if production is not None:
+        settings = Settings(**{**settings.__dict__, "environment": "production" if production else settings.environment})
+    settings.ensure_dirs()
+    engine = make_engine(settings.database_url)
+    create_schema(engine)
+    SessionLocal = make_session_factory(engine)
+    with SessionLocal() as db:
+        bootstrap_admin(db)
+
     app = FastAPI(title="Jobs Catcher")
-    app.state.store = store
+    app.state.settings = settings
+    app.state.engine = engine
+    app.state.SessionLocal = SessionLocal
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts) + ["testserver"])
 
-    def audit(action, actor_id=None, target_user_id=None, **meta):
-        store.audit.append({"action": action, "actor_id": actor_id, "target_user_id": target_user_id, "meta": meta})
+    def db_session() -> Session:
+        return SessionLocal()
 
-    def current_user(request: Request):
+    def audit(db: Session, action: str, actor_id=None, target_user_id=None, request: Request | None = None, **meta):
+        from .audit import redact_event
+        safe = redact_event(meta)
+        db.add(AuditLog(action=action, actor_user_id=actor_id, target_user_id=target_user_id, ip=(request.client.host if request and request.client else ""), user_agent=(request.headers.get("user-agent", "")[:255] if request else ""), metadata_json=dumps(safe)))
+
+    def current_user(db: Session, request: Request) -> tuple[User, str]:
         token = request.cookies.get("session")
-        uid = store.sessions.get(auth.hash_token(token or ""))
-        if not uid: raise HTTPException(401)
-        user = store.users.get(uid)
-        if not user or user.get("deleted"):
-            if token: store.sessions.pop(auth.hash_token(token), None)
+        token_hash = auth.hash_token(token or "")
+        session = db.scalar(select(UserSession).where(UserSession.token_hash == token_hash, UserSession.expires_at > utcnow()))
+        if not session:
             raise HTTPException(401)
-        if user.get("must_change_password") and request.url.path not in {"/change-password", "/logout"}:
+        user = db.get(User, session.user_id)
+        if not user or user.deleted_at is not None:
+            db.execute(delete(UserSession).where(UserSession.token_hash == token_hash)); db.commit()
+            raise HTTPException(401)
+        if user.must_change_password and request.url.path not in {"/change-password", "/logout"}:
             raise HTTPException(403, "password change required")
-        return user, token
+        return user, token or ""
 
     def require_csrf(request: Request, token: str):
-        value = request.headers.get("x-csrf-token") or request.query_params.get("csrf")
+        value = request.headers.get("x-csrf-token") or request.form if False else request.headers.get("x-csrf-token") or request.query_params.get("csrf")
         if not auth.verify_csrf(token, value or ""):
             raise HTTPException(403, "CSRF")
 
-    def require_admin(request: Request):
-        user, token = current_user(request)
-        if user["role"] != "superuser": raise HTTPException(403)
+    def require_admin(db: Session, request: Request) -> tuple[User, str]:
+        user, token = current_user(db, request)
+        if user.role != "superuser":
+            raise HTTPException(403)
         return user, token
+
+    def set_session_cookie(resp, token: str):
+        resp.set_cookie("session", token, httponly=True, samesite="lax", secure=settings.production)
+        resp.set_cookie("csrf", auth.csrf_token(token), httponly=False, samesite="lax", secure=settings.production)
+
+    def enqueue(db: Session, user_id: int | None, job_type: str, payload: dict, active_key: str | None = None) -> BackgroundJob:
+        if active_key:
+            existing = db.scalar(select(BackgroundJob).where(BackgroundJob.active_key == active_key, BackgroundJob.status.in_(queue.ACTIVE_STATUSES)))
+            if existing:
+                return existing
+        job = BackgroundJob(user_id=user_id, type=job_type, status="queued", payload_json=dumps(payload), active_key=active_key)
+        db.add(job)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            with db_session() as db2:
+                existing = db2.scalar(select(BackgroundJob).where(BackgroundJob.active_key == active_key))
+                return existing
+        return job
 
     @app.middleware("http")
     async def security_headers(request, call_next):
-        resp = await call_next(request)
+        try:
+            resp = await call_next(request)
+        except HTTPException:
+            raise
         resp.headers["x-content-type-options"] = "nosniff"
         resp.headers["x-frame-options"] = "DENY"
         resp.headers["referrer-policy"] = "same-origin"
+        resp.headers["content-security-policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'"
         return resp
 
     @app.get("/health/live")
-    def live(): return {"status": "ok"}
+    def live():
+        return {"status": "ok"}
 
     @app.get("/health/ready")
-    def ready(): return {"status": "ready", "db": True}
+    def ready():
+        checks = {"db": False, "data_dir": False, "upload_dir": False, "codex_bin": bool(shutil.which(settings.codex_bin) or Path(settings.codex_bin).exists())}
+        try:
+            with db_session() as db:
+                db.execute(select(func.count(User.id))).scalar()
+            checks["db"] = True
+        except Exception:
+            checks["db"] = False
+        for key, path in [("data_dir", settings.data_dir), ("upload_dir", settings.upload_dir)]:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                probe = path / ".ready"
+                probe.write_text("ok", encoding="utf-8")
+                probe.unlink(missing_ok=True)
+                checks[key] = True
+            except Exception:
+                checks[key] = False
+        ok = all(checks.values())
+        return JSONResponse({"status": "ready" if ok else "not_ready", **checks}, status_code=200 if ok else 503)
 
     @app.get("/signup")
-    def signup(): raise HTTPException(404)
+    @app.get("/register")
+    @app.get("/users/new")
+    def no_signup():
+        raise HTTPException(404)
+
+    @app.get("/login", response_class=HTMLResponse)
+    def login_page():
+        return "<form method='post'><input name='login'><input name='password' type='password'><button>Login</button></form>"
 
     @app.post("/login")
-    def login(login: str = Form(...), password: str = Form(...)):
-        now = int(time.time())
-        if store.limiter.is_blocked(login, now): raise HTTPException(429)
-        user = next((u for u in store.users.values() if u["login"] == login and not u.get("deleted")), None)
-        if not user or not auth.verify_password(user["password_hash"], password):
-            store.limiter.record_failure(login, now); audit("login_failed", None, None, login=login); raise HTTPException(401)
-        token, session = auth.new_session(user["id"]); store.sessions[session.token_hash] = user["id"]
-        audit("login", user["id"], user["id"])
-        target = "/change-password" if user["must_change_password"] else "/dashboard"
-        resp = RedirectResponse(target, status_code=303)
-        resp.set_cookie("session", token, httponly=True, samesite="lax", secure=production)
-        resp.set_cookie("csrf", auth.csrf_token(token), httponly=False, samesite="lax", secure=production)
-        return resp
+    def login(request: Request, login: str = Form(...), password: str = Form(...)):
+        now = utcnow()
+        ip = request.client.host if request.client else ""
+        with db_session() as db:
+            failures = db.scalar(select(func.count(LoginAttempt.id)).where(LoginAttempt.login == login, LoginAttempt.ip == ip, LoginAttempt.success == False, LoginAttempt.created_at >= now - timedelta(minutes=15)))
+            if failures >= 5:
+                raise HTTPException(429)
+            user = db.scalar(select(User).where(User.login == login, User.deleted_at.is_(None)))
+            if not user or not auth.verify_password(user.password_hash, password):
+                db.add(LoginAttempt(login=login, ip=ip, success=False)); audit(db, "login_failed", None, None, request, login=login); db.commit(); raise HTTPException(401)
+            db.add(LoginAttempt(login=login, ip=ip, success=True))
+            old_hash = auth.hash_token(request.cookies.get("session") or "")
+            db.execute(delete(UserSession).where(UserSession.token_hash == old_hash))
+            token, session_obj = auth.new_session(user.id)
+            db.add(UserSession(user_id=user.id, token_hash=session_obj.token_hash, csrf_hash=auth.hash_token(auth.csrf_token(token)), expires_at=session_expiry()))
+            audit(db, "login", user.id, user.id, request)
+            db.commit()
+            resp = RedirectResponse("/change-password" if user.must_change_password else "/dashboard", status_code=303)
+            set_session_cookie(resp, token)
+            return resp
 
     @app.post("/logout")
     def logout(request: Request):
-        user, token = current_user(request); require_csrf(request, token)
-        store.sessions.pop(auth.hash_token(token), None); audit("logout", user["id"], user["id"])
-        resp = RedirectResponse("/login", status_code=303); resp.delete_cookie("session"); return resp
+        with db_session() as db:
+            user, token = current_user(db, request); require_csrf(request, token)
+            db.execute(delete(UserSession).where(UserSession.token_hash == auth.hash_token(token)))
+            audit(db, "logout", user.id, user.id, request); db.commit()
+        resp = RedirectResponse("/login", status_code=303); resp.delete_cookie("session"); resp.delete_cookie("csrf"); return resp
+
+    @app.get("/change-password", response_class=HTMLResponse)
+    def change_password_page(request: Request):
+        with db_session() as db: current_user(db, request)
+        return "<form method='post'><input name='password' type='password'><button>Change</button></form>"
 
     @app.post("/change-password")
     def change_password(request: Request, password: str = Form(...)):
-        user, token = current_user(request); require_csrf(request, token)
-        auth.validate_password(user["login"], password)
-        user["password_hash"] = auth.hash_password(password); user["must_change_password"] = False
-        store.sessions.pop(auth.hash_token(token), None)
-        new_token, session = auth.new_session(user["id"]); store.sessions[session.token_hash] = user["id"]
-        audit("password_changed", user["id"], user["id"])
-        resp = RedirectResponse("/dashboard", status_code=303); resp.set_cookie("session", new_token, httponly=True, samesite="lax", secure=production); resp.set_cookie("csrf", auth.csrf_token(new_token), samesite="lax", secure=production); return resp
+        with db_session() as db:
+            user, token = current_user(db, request); require_csrf(request, token)
+            auth.validate_password(user.login, password)
+            user.password_hash = auth.hash_password(password); user.must_change_password = False
+            db.execute(delete(UserSession).where(UserSession.user_id == user.id))
+            new_token, session_obj = auth.new_session(user.id)
+            db.add(UserSession(user_id=user.id, token_hash=session_obj.token_hash, csrf_hash=auth.hash_token(auth.csrf_token(new_token)), expires_at=session_expiry()))
+            audit(db, "password_changed", user.id, user.id, request); db.commit()
+            resp = RedirectResponse("/dashboard", status_code=303); set_session_cookie(resp, new_token); return resp
 
     @app.post("/admin/users")
     def create_user(request: Request, login: str = Form(...), password: str = Form(...), display_name: str = Form("")):
-        admin, token = require_admin(request); require_csrf(request, token); auth.validate_password(login, password)
-        uid = store.next_user; store.next_user += 1
-        store.users[uid] = {"id": uid, "login": login, "password_hash": auth.hash_password(password), "role": "user", "must_change_password": True, "deleted": False, "display_name": display_name}
-        audit("user_created", admin["id"], uid)
-        return {"id": uid}
+        with db_session() as db:
+            admin, token = require_admin(db, request); require_csrf(request, token); auth.validate_password(login, password)
+            user = User(login=login, password_hash=auth.hash_password(password), role="user", display_name=display_name or None, must_change_password=True)
+            db.add(user); db.flush(); audit(db, "user_created", admin.id, user.id, request); db.commit(); return {"id": user.id}
 
     @app.delete("/admin/users/{uid}")
     def delete_user(uid: int, request: Request):
-        admin, token = require_admin(request); require_csrf(request, token)
-        if uid not in store.users: raise HTTPException(404)
-        store.users[uid]["deleted"] = True; store.resumes.pop(uid, None); store.profiles.pop(uid, None); store.criteria_versions.pop(uid, None); audit("user_deleted", admin["id"], uid); return {"deleted": uid}
+        with db_session() as db:
+            admin, token = require_admin(db, request); require_csrf(request, token)
+            user = db.get(User, uid)
+            if not user or user.deleted_at is not None: raise HTTPException(404)
+            files = [Path(r.path) for r in db.scalars(select(ResumeFile).where(ResumeFile.user_id == uid)).all()]
+            user.deleted_at = utcnow(); user.login = f"deleted-{uid}-{user.login}"; user.must_change_password = True
+            for model in [UserSession, LoginAttempt, UserSchedule, BackgroundJob, SearchRun, VacancyScore, VacancyUIState, CoverLetter, CriteriaVersion, ProfileVersion, ResumeFile]:
+                if hasattr(model, "user_id"):
+                    db.execute(delete(model).where(model.user_id == uid))
+            audit(db, "user_deleted", admin.id, uid, request); db.commit()
+            for path in files:
+                try: path.unlink(missing_ok=True)
+                except Exception: pass
+            return {"deleted": uid}
 
     @app.post("/resume")
     async def upload_resume(request: Request, file: UploadFile = File(...)):
-        user, token = current_user(request); require_csrf(request, token)
-        content = await file.read(); check = documents.validate_upload(file.filename or "", content, file.content_type or "")
-        text = documents.extract_docx_text(content) if check.kind == "docx" else documents.extract_pdf_text(content)
-        store.resumes[user["id"]] = {"name": check.original_name, "safe_name": check.safe_name, "sha256": check.sha256, "kind": check.kind, "text": text}
-        store.jobs.enqueue(user["id"], "resume_profile_extraction", {"heartbeat": int(time.time())}); audit("resume_uploaded", user["id"], user["id"], filename=check.safe_name)
-        return {"kind": check.kind, "sha256": check.sha256}
+        content = await file.read()
+        with db_session() as db:
+            user, token = current_user(db, request); require_csrf(request, token)
+            check = documents.validate_upload(file.filename or "", content, file.content_type or "", max_bytes=settings.resume_size_limit)
+            try:
+                text = documents.extract_docx_text(content) if check.kind == "docx" else documents.extract_pdf_text(content)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            stored_name = f"{uuid.uuid4().hex}.{check.kind}"
+            path = settings.upload_dir / stored_name
+            path.write_bytes(content)
+            old_paths = [Path(r.path) for r in db.scalars(select(ResumeFile).where(ResumeFile.user_id == user.id, ResumeFile.active == True)).all()]
+            db.execute(update(ResumeFile).where(ResumeFile.user_id == user.id).values(active=False))
+            resume = ResumeFile(user_id=user.id, original_name=check.original_name, stored_name=stored_name, mime=file.content_type or "", size=len(content), sha256=check.sha256, path=str(path), extracted_text=text, active=True)
+            db.add(resume); db.flush()
+            enqueue(db, user.id, "resume_profile_extraction", {"resume_file_id": resume.id})
+            audit(db, "resume_uploaded", user.id, user.id, request, filename=check.safe_name, sha256=check.sha256)
+            db.commit()
+            for old in old_paths:
+                try: old.unlink(missing_ok=True)
+                except Exception: pass
+            return {"id": resume.id, "kind": check.kind, "sha256": check.sha256, "stored": stored_name}
 
     @app.post("/onboarding")
-    def onboarding(request: Request, desired_titles: str = Form("AI Analyst"), locations: str = Form("Москва"), remote: bool = Form(False)):
-        user, token = current_user(request); require_csrf(request, token)
-        profile = {"title": desired_titles, "locations": [locations], "remote": remote, "confirmed": False, "facts": []}
-        store.profiles[user["id"]] = profile
-        return profile
+    async def onboarding(request: Request):
+        form = await request.form()
+        with db_session() as db:
+            user, token = current_user(db, request); require_csrf(request, token)
+            data = {k: form.get(k) for k in form.keys() if k != "csrf"}
+            for key in ["desired_titles", "directions", "adjacent_roles", "cities", "employment_types", "must_have", "undesired_duties", "stop_factors"]:
+                if isinstance(data.get(key), str):
+                    data[key] = [x.strip() for x in data[key].replace(";", ",").split(",") if x.strip()]
+            data["remote"] = str(form.get("remote", "")).lower() in {"true", "on", "1", "yes"}
+            data["all_russia"] = str(form.get("all_russia", "")).lower() in {"true", "on", "1", "yes"}
+            data["relocation"] = str(form.get("relocation", "")).lower() in {"true", "on", "1", "yes"}
+            latest = db.scalar(select(ProfileVersion).where(ProfileVersion.user_id == user.id).order_by(ProfileVersion.version.desc()))
+            profile = loads(latest.data_json) if latest else {"professional_title": (data.get("desired_titles") or ["Профиль"])[0], "facts_for_applications": []}
+            profile["onboarding"] = data
+            version = (latest.version if latest else 0) + 1
+            pv = ProfileVersion(user_id=user.id, resume_file_id=latest.resume_file_id if latest else None, version=version, data_json=dumps(profile), confirmed=False)
+            db.add(pv); audit(db, "onboarding_saved", user.id, user.id, request); db.commit(); return profile
 
     @app.post("/profile/confirm")
     def confirm_profile(request: Request):
-        user, token = current_user(request); require_csrf(request, token)
-        if user["id"] not in store.profiles: raise HTTPException(400)
-        store.profiles[user["id"]]["confirmed"] = True
-        c = criteria.DEFAULT_CRITERIA.copy(); c["search"] = dict(criteria.DEFAULT_CRITERIA["search"]); c["search"]["desired_titles"] = [store.profiles[user["id"]]["title"]]; c["search"]["locations"] = store.profiles[user["id"]]["locations"]
-        store.criteria_versions[user["id"]] = [criteria.next_version([], criteria.validate_criteria(c))]
-        audit("profile_confirmed", user["id"], user["id"]); audit("criteria_changed", user["id"], user["id"])
-        return {"confirmed": True, "criteria_version": 1}
+        with db_session() as db:
+            user, token = current_user(db, request); require_csrf(request, token)
+            profile = db.scalar(select(ProfileVersion).where(ProfileVersion.user_id == user.id).order_by(ProfileVersion.version.desc()))
+            if not profile: raise HTTPException(400)
+            profile.confirmed = True
+            audit(db, "profile_confirmed", user.id, user.id, request, profile_version_id=profile.id)
+            # criteria generation job, handled by worker; also create fallback criteria for immediate editability
+            enqueue(db, user.id, "criteria_generation", {"profile_version_id": profile.id})
+            db.commit(); return {"confirmed": True, "profile_version_id": profile.id}
 
     @app.post("/criteria")
-    def save_criteria(request: Request, payload: dict):
-        user, token = current_user(request); require_csrf(request, token)
-        valid = criteria.validate_criteria(payload); versions = store.criteria_versions.setdefault(user["id"], [])
-        version = criteria.next_version(versions, valid); versions.append(version); audit("criteria_changed", user["id"], user["id"], version=version["version"]); return version
+    async def save_criteria(request: Request):
+        body = await request.body()
+        suffix = request.query_params.get("format", ".json")
+        with db_session() as db:
+            user, token = current_user(db, request); require_csrf(request, token)
+            try:
+                payload = criteria.load_criteria(body.decode() or "{}", suffix) if body else {}
+                valid = criteria.validate_criteria(payload)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            latest = db.scalar(select(CriteriaVersion).where(CriteriaVersion.user_id == user.id).order_by(CriteriaVersion.version.desc()))
+            profile = db.scalar(select(ProfileVersion).where(ProfileVersion.user_id == user.id, ProfileVersion.confirmed == True).order_by(ProfileVersion.version.desc()))
+            version = (latest.version if latest else 0) + 1
+            cv = CriteriaVersion(user_id=user.id, profile_version_id=profile.id if profile else None, version=version, data_json=dumps(valid))
+            db.add(cv); audit(db, "criteria_changed", user.id, user.id, request, version=version); db.commit(); return {"version": version, "id": cv.id}
 
     @app.post("/schedule")
-    def schedule(request: Request, interval_days: int = Form(...), sources: str = Form("hh,habr")):
-        user, token = current_user(request); require_csrf(request, token)
-        try:
-            queue.validate_schedule(interval_days)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        store.schedules[user["id"]] = {"interval_days": interval_days, "sources": [s.strip() for s in sources.split(",") if s.strip()]}; audit("schedule_changed", user["id"], user["id"]); return store.schedules[user["id"]]
-
-    @app.post("/worker/run-fixtures")
-    def run_fixtures(request: Request):
-        user, token = current_user(request); require_csrf(request, token)
-        if not store.profiles.get(user["id"], {}).get("confirmed"): raise HTTPException(400)
-        c = store.criteria_versions[user["id"]][-1]
-        samples = [{"title":"AI Solution Analyst","company":"ACME","description":"LLM RAG agent API integration requirements analyst chatbot prototype AI","url":"https://e/1"},{"title":"QA engineer","company":"Other","description":"QA support manual testing","url":"https://e/2"}]
-        created=[]
-        for s in samples:
-            vid=store.next_vacancy; store.next_vacancy+=1; pre=scoring.deterministic_prescore(s,c); s.update({"id":vid,"user_id":user["id"],"decision":pre["decision"],"score":pre["score"],"why":"LLM/API fit" if pre["score"]>8 else "Low fit","resume_angle":"analysis and integrations"}); store.vacancies[vid]=s; created.append(vid)
-        audit("search_completed", user["id"], user["id"], count=len(created)); return {"vacancies": created}
+    def schedule(request: Request, interval_days: int = Form(...), sources: str = Form("hh,habr,superjob,rabota,geekjob,getmatch"), run_time: str = Form("09:00"), timezone: str = Form("Europe/Moscow")):
+        with db_session() as db:
+            user, token = current_user(db, request); require_csrf(request, token)
+            try:
+                queue.validate_schedule(interval_days)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            if interval_days > settings.max_schedule_interval_days: raise HTTPException(400)
+            selected = [s.strip() for s in sources.split(",") if s.strip()]
+            sched = db.scalar(select(UserSchedule).where(UserSchedule.user_id == user.id))
+            if not sched:
+                sched = UserSchedule(user_id=user.id, interval_days=interval_days, sources_json=dumps(selected)); db.add(sched)
+            sched.interval_days = interval_days; sched.sources_json = dumps(selected); sched.run_time = run_time; sched.timezone = timezone; sched.next_run_at = utcnow()
+            audit(db, "schedule_changed", user.id, user.id, request); db.commit(); return {"interval_days": interval_days, "sources": selected}
 
     @app.get("/vacancies", response_class=HTMLResponse)
-    def vacancies(request: Request):
-        user, _ = current_user(request); rows=[v for v in store.vacancies.values() if v["user_id"]==user["id"]]
-        return "\n".join(f"<article>{v['decision']} {v['title']} {v['company']}</article>" for v in rows)
+    def vacancies(request: Request, decision: str | None = None, hide_viewed: bool = False):
+        with db_session() as db:
+            user, _ = current_user(db, request)
+            rows = db.execute(select(Vacancy, VacancyScore).join(VacancyScore, VacancyScore.vacancy_id == Vacancy.id).where(VacancyScore.user_id == user.id).order_by(VacancyScore.final_score.desc().nullslast(), VacancyScore.prescore.desc())).all()
+            parts = ["<h1>Вакансии</h1><nav>Все | Откликаться | Адаптировать резюме | Рассмотреть | Мимо</nav>"]
+            for v, score in rows:
+                if decision and score.decision != decision: continue
+                viewed = db.scalar(select(VacancyUIState).where(VacancyUIState.user_id == user.id, VacancyUIState.vacancy_id == v.id, VacancyUIState.viewed_at.is_not(None)))
+                if hide_viewed and viewed: continue
+                parts.append(f"<article><a href='/vacancies/{v.id}'>{escape(v.title)}</a> <b>{escape(score.decision)}</b> {score.final_score or score.prescore}/22 <span>{escape(v.company)}</span></article>")
+            return "\n".join(parts)
 
     @app.get("/vacancies/{vid}", response_class=HTMLResponse)
     def vacancy_detail(vid: int, request: Request):
-        user, _ = current_user(request); v=store.vacancies.get(vid)
-        if not v or v["user_id"] != user["id"]: raise HTTPException(404)
-        store.viewed.add((user["id"], vid)); return f"<h1>{v['title']}</h1><p>{v['description']}</p>"
+        with db_session() as db:
+            user, _ = current_user(db, request)
+            score = db.scalar(select(VacancyScore).where(VacancyScore.user_id == user.id, VacancyScore.vacancy_id == vid))
+            if not score: raise HTTPException(404)
+            v = db.get(Vacancy, vid)
+            state = db.scalar(select(VacancyUIState).where(VacancyUIState.user_id == user.id, VacancyUIState.vacancy_id == vid))
+            if not state:
+                state = VacancyUIState(user_id=user.id, vacancy_id=vid); db.add(state)
+            state.viewed_at = utcnow(); db.commit()
+            rec = loads(score.recommendations_json)
+            return f"<h1>{escape(v.title)}</h1><p>{escape(v.company)} — {escape(v.location)}</p><p>{escape(v.description)}</p><section>{escape(rec.get('why_fits',''))}</section>"
 
     @app.get("/export", response_class=PlainTextResponse)
     def export_text(request: Request):
-        user, _ = current_user(request); rows=[v for v in store.vacancies.values() if v["user_id"]==user["id"]]
-        return export.plain_text_selection(rows)
+        with db_session() as db:
+            user, _ = current_user(db, request)
+            rows=[]
+            for v, score in db.execute(select(Vacancy, VacancyScore).join(VacancyScore, VacancyScore.vacancy_id == Vacancy.id).where(VacancyScore.user_id == user.id)).all():
+                rec=loads(score.recommendations_json)
+                src=db.scalar(select(VacancySource).where(VacancySource.vacancy_id == v.id))
+                rows.append({"decision":score.decision,"title":v.title,"company":v.company,"url":src.source_url if src else v.canonical_url,"why":rec.get("why_fits",""),"resume_angle":"; ".join(rec.get("resume_angle",[])) if isinstance(rec.get("resume_angle"), list) else rec.get("resume_angle","")})
+            return export.plain_text_selection(rows)
 
     @app.post("/vacancies/{vid}/letter")
     def letter(vid: int, request: Request):
-        user, token = current_user(request); require_csrf(request, token); v=store.vacancies.get(vid)
-        if not v or v["user_id"] != user["id"]: raise HTTPException(404)
-        text = export.validate_cover_letter(f"Здравствуйте! Заинтересовала вакансия {v['title']}: могу быть полезен опытом в анализе требований, AI-интеграциях и запуске практичных решений.")
-        store.letters.append({"user_id": user["id"], "vacancy_id": vid, "text": text}); audit("letter_generated", user["id"], user["id"], vacancy_id=vid); return {"text": text, "length": len(text)}
+        with db_session() as db:
+            user, token = current_user(db, request); require_csrf(request, token)
+            if not db.scalar(select(VacancyScore).where(VacancyScore.user_id == user.id, VacancyScore.vacancy_id == vid)): raise HTTPException(404)
+            job = enqueue(db, user.id, "generate_cover_letter", {"vacancy_id": vid})
+            audit(db, "letter_requested", user.id, user.id, request, vacancy_id=vid); db.commit(); return {"job_id": job.id}
 
     @app.get("/admin/audit")
     def audit_log(request: Request):
-        require_admin(request); return JSONResponse(store.audit)
+        with db_session() as db:
+            require_admin(db, request)
+            rows = db.scalars(select(AuditLog).order_by(AuditLog.id.desc()).limit(200)).all()
+            return [{"action": r.action, "actor_id": r.actor_user_id, "target_user_id": r.target_user_id, "metadata": loads(r.metadata_json), "created_at": r.created_at.isoformat()} for r in rows]
+
+    @app.get("/admin/jobs")
+    def admin_jobs(request: Request):
+        with db_session() as db:
+            require_admin(db, request)
+            return [{"id": j.id, "type": j.type, "status": j.status, "attempts": j.attempts, "progress": j.progress} for j in db.scalars(select(BackgroundJob).order_by(BackgroundJob.id.desc()).limit(200))]
+
+    @app.get("/admin/runs")
+    def admin_runs(request: Request):
+        with db_session() as db:
+            require_admin(db, request)
+            return [{"id": r.id, "user_id": r.user_id, "status": r.status, "average_prescore": r.average_prescore} for r in db.scalars(select(SearchRun).order_by(SearchRun.id.desc()).limit(100))]
+
+    @app.get("/admin/source-health")
+    def admin_source_health(request: Request):
+        with db_session() as db:
+            require_admin(db, request)
+            return [{"source": s.source, "status": s.status, "last_error": s.last_error} for s in db.scalars(select(SourceHealth))]
+
+    @app.get("/admin/settings")
+    def admin_settings(request: Request):
+        with db_session() as db:
+            require_admin(db, request)
+            return {"min_schedule_interval_days": settings.min_schedule_interval_days, "enabled_sources": settings.enabled_sources, "model": "gpt-5.4-mini", "reasoning": "low"}
 
     @app.get("/dashboard", response_class=HTMLResponse)
-    def dashboard(request: Request): current_user(request); return "Dashboard"
+    def dashboard(request: Request):
+        with db_session() as db:
+            user, _ = current_user(db, request)
+            jobs = db.scalar(select(func.count(BackgroundJob.id)).where(BackgroundJob.user_id == user.id, BackgroundJob.status.in_(queue.ACTIVE_STATUSES)))
+            scores = db.scalar(select(func.count(VacancyScore.id)).where(VacancyScore.user_id == user.id))
+            return f"<h1>Dashboard</h1><p>Jobs: {jobs}</p><p>Vacancies: {scores}</p>"
 
     return app

@@ -52,3 +52,12 @@ def test_csrf_matrix_rate_limit_and_secure_cookie_in_production():
     assert bad.post('/login', data={'login':'nobody','password':'bad'}).status_code == 429
     other=TestClient(app)
     assert other.post('/login', data={'login':'someone_else','password':'bad'}).status_code == 401
+
+def test_upload_extract_errors_are_client_errors():
+    _store, _app, _admin, _acsrf, user, ucsrf = setup_users()
+    assert user.post('/change-password', data={'password':'alice strong password 42'}, headers={'x-csrf-token':ucsrf}, follow_redirects=False).status_code == 303
+    ucsrf=user.cookies.get('csrf')
+    r=user.post('/resume', files={'file':('resume.pdf', b'%PDF-1.4\nno text layer\n%%EOF', 'application/pdf')}, headers={'x-csrf-token':ucsrf})
+    assert r.status_code == 400
+    r=user.post('/criteria', content='{}', headers={'x-csrf-token':ucsrf})
+    assert r.status_code == 400

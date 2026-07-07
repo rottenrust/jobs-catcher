@@ -52,16 +52,23 @@ def extract_pdf_text(content: bytes) -> str:
         raise ValueError("invalid PDF")
     if b"/Encrypt" in content:
         raise ValueError("encrypted PDF is not supported")
-    decoded = content.decode("latin1", errors="ignore")
-    if not re.search(rb"\([^()]{2,}\)", content):
-        raise ValueError("PDF has no extractable text layer")
-    strings = re.findall(r"\(([^()]{2,})\)", decoded)
-    text = " ".join(strings) or " ".join(re.findall(r"[A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9 ,.;:+#/-]{4,}", decoded))
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(BytesIO(content))
+        if getattr(reader, "is_encrypted", False):
+            raise ValueError("encrypted PDF is not supported")
+        parts = [(page.extract_text() or "") for page in reader.pages]
+        text = " ".join(parts)
+    except ValueError:
+        raise
+    except Exception:
+        decoded = content.decode("latin1", errors="ignore")
+        strings = re.findall(r"\(([^()]{2,})\)", decoded)
+        text = " ".join(strings)
     text = re.sub(r"\s+", " ", text).strip()
-    if len(text) < 5 or text in {"/Pages"}:
+    if len(text) < 5:
         raise ValueError("PDF has no extractable text layer")
     return text
-
 
 def extract_docx_text(content: bytes, *, max_uncompressed: int = 20 * 1024 * 1024) -> str:
     try:

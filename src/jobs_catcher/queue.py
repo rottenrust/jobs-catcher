@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 STATUSES = {"queued", "running", "searching", "fetching_details", "prescoring", "codex_scoring", "importing", "completed", "failed", "cancelled"}
+ACTIVE_STATUSES = {"queued", "running", "searching", "fetching_details", "prescoring", "codex_scoring", "importing"}
 
 def validate_schedule(interval_days: int) -> None:
     if interval_days < 1: raise ValueError("minimum schedule interval is one day")
@@ -21,7 +22,7 @@ class JobQueue:
     def recover_stale(self, now: int, stale_after_seconds: int = 900) -> int:
         n=0
         for job in self.jobs.values():
-            if job["status"] in STATUSES - {"queued", "completed", "failed", "cancelled"} and now - job.get("heartbeat", 0) > stale_after_seconds:
+            if job["status"] in ACTIVE_STATUSES - {"queued"} and now - job.get("heartbeat", 0) > stale_after_seconds:
                 job["status"] = "queued"; job["attempts"] += 1; n += 1
         return n
 

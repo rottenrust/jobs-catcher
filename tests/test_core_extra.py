@@ -7,9 +7,9 @@ def test_all_decision_thresholds(score, decision):
     assert scoring.decision_for_score(score, criteria.DEFAULT_CRITERIA) == decision
 
 def test_prescore_bounds_caps_and_equality_exclusion():
-    c=criteria.DEFAULT_CRITERIA
-    high=scoring.deterministic_prescore({"title":"AI analyst","description":"LLM RAG agent API integration requirements chatbot prototype"}, c)
-    low=scoring.deterministic_prescore({"title":"QA","description":"QA support manual testing"}, c)
+    c={**criteria.DEFAULT_CRITERIA, "scoring": {**criteria.DEFAULT_CRITERIA["scoring"], "positive_rules": [{"name":"target","weight":12,"any_terms":["inventory","warehouse"]}], "red_flag_rules": [{"name":"night","penalty":8,"cap":8,"terms":["night"]}], "hard_reject_rules": []}}
+    high=scoring.deterministic_prescore({"title":"Warehouse manager","description":"inventory process improvement"}, c)
+    low=scoring.deterministic_prescore({"title":"Night guard","description":"night shifts"}, c)
     assert 0 <= high["score"] <= 22 and high["score"] > low["score"]
     assert low["caps"] and low["score"] <= 8
     rows=[{"user_id":1,"run_id":1,"vacancy_id":"eq","prescore":10,"has_full_description":True},{"user_id":1,"run_id":1,"vacancy_id":"hi","prescore":12,"has_full_description":True},{"user_id":1,"run_id":1,"vacancy_id":"no","prescore":22,"has_full_description":False}]

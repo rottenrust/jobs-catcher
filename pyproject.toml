@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "Closed multi-user vacancy search and scoring service"
 requires-python = ">=3.12"
 dependencies = [
-  "fastapi>=0.115",
+  "fastapi>=0.115,<0.139",
+  "starlette<1.0",
   "uvicorn[standard]>=0.30",
   "jinja2>=3.1",
   "sqlalchemy>=2.0",
@@ -13,13 +14,16 @@ dependencies = [
   "python-multipart>=0.0.9",
   "pydantic>=2.8",
   "pyyaml>=6.0",
-  "httpx2>=0.28",
+  "httpx>=0.27",
+  "pypdf>=4.3",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.2"]
+dev = ["pytest>=8.2", "ruff>=0.6"]
+
+[tool.ruff.lint]
+select = ["F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-
