@@ -337,7 +337,7 @@ def _upsert_source_snapshot(db: Session, vacancy: Vacancy, item: dict) -> Vacanc
     return row
 
 
-def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings, runner, adapter_factory=None) -> None:
+def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings, runner, adapter_factory=None, heartbeat=None) -> None:
     settings = settings_from_db(db, settings)
     profile = db.scalar(select(ProfileVersion).where(ProfileVersion.user_id == job.user_id, ProfileVersion.confirmed == True).order_by(ProfileVersion.version.desc()))
     crit_v = db.scalar(select(CriteriaVersion).where(CriteriaVersion.user_id == job.user_id).order_by(CriteriaVersion.version.desc()))
@@ -350,6 +350,14 @@ def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings,
     db.add(run)
     db.flush()
     audit(db, "search_started", job.user_id, job.user_id, run_id=run.id)
+    db.commit()
+
+    def beat(progress: int | None = None) -> None:
+        if heartbeat:
+            heartbeat(progress)
+        else:
+            touch_job(db, job, progress=progress)
+            db.commit()
     queries = crit["search"].get("queries") or crit["search"].get("desired_titles") or [profile_data.get("professional_title", "")]
     schedule = db.scalar(select(UserSchedule).where(UserSchedule.user_id == job.user_id))
     requested_sources = loads(schedule.sources_json, list(settings.enabled_sources)) if schedule else list(settings.enabled_sources)
@@ -371,11 +379,11 @@ def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings,
             for query in queries[:settings.max_search_queries]:
                 if source_seen >= settings.max_results_per_source or total_seen >= settings.max_vacancies_per_run:
                     break
-                touch_job(db, job, progress=min(55, 5 + total_seen))
+                beat(min(55, 5 + total_seen))
                 for result in adapter.search(query, preferences):
                     if source_seen >= settings.max_results_per_source or total_seen >= settings.max_vacancies_per_run:
                         break
-                    touch_job(db, job, progress=min(60, 10 + total_seen))
+                    beat(min(60, 10 + total_seen))
                     full = adapter.fetch_details(result)
                     item = adapter.normalize(full)
                     vacancy = _upsert_vacancy(db, item)
@@ -390,14 +398,17 @@ def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings,
                     scores.append({"user_id":job.user_id,"run_id":run.id,"vacancy_id":vacancy.id,"prescore":pre["score"],"has_full_description":bool(vacancy.description)})
                     source_seen += 1
                     total_seen += 1
+                    db.commit()
             successful_sources += 1
             health = db.scalar(select(SourceHealth).where(SourceHealth.source == source)) or SourceHealth(source=source, status="ok")
             health.status="ok"; health.last_error=None; health.checked_at=utcnow(); db.add(health)
+            db.commit()
         except Exception as exc:
             errors.append({"source":source,"error":str(exc)})
             audit(db, "source_error", job.user_id, job.user_id, run_id=run.id, source=source, error=str(exc)[:500])
             health = db.scalar(select(SourceHealth).where(SourceHealth.source == source)) or SourceHealth(source=source, status="error")
             health.status="error"; health.last_error=str(exc); health.checked_at=utcnow(); db.add(health)
+            db.commit()
         finally:
             if adapter is not None and hasattr(adapter, "close"):
                 adapter.close()
@@ -410,7 +421,7 @@ def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings,
     run_dir.mkdir(parents=True, exist_ok=True)
     batch_size = max(1, settings.codex_batch_size)
     for start in range(0, len(candidates), batch_size):
-        touch_job(db, job, progress=min(95, 60 + int(35 * start / max(1, len(candidates)))))
+        beat(min(95, 60 + int(35 * start / max(1, len(candidates)))))
         for vacancy_id in candidates[start:start + batch_size]:
             score = db.scalar(select(VacancyScore).where(VacancyScore.user_id == job.user_id, VacancyScore.run_id == run.id, VacancyScore.vacancy_id == vacancy_id))
             vacancy = db.get(Vacancy, vacancy_id)
@@ -422,15 +433,18 @@ def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings,
             try:
                 job.status="codex_scoring"
                 job.progress=min(95, 60 + int(35 * (len(outputs)+1) / max(1, len(candidates))))
-                touch_job(db, job, progress=job.progress)
+                db.commit()
+                beat(job.progress)
                 result = runner.run("vacancy_evaluation", prompt, lambda data, vid=str(vacancy.id): codex_integration.validate_codex_result(data, vid, crit), run_dir)
                 score.final_score = result["score"]
                 score.decision = result["decision"]
                 score.recommendations_json = dumps(result)
                 outputs.append(result)
+                db.commit()
             except Exception as exc:
                 errors.append({"vacancy_id":vacancy_id,"error":str(exc)})
                 audit(db, "codex_error", job.user_id, job.user_id, run_id=run.id, vacancy_id=vacancy_id, error=str(exc)[:500])
+                db.commit()
     if attempted_sources == 0 or successful_sources == 0:
         status = "failed"
     elif errors:
@@ -445,6 +459,7 @@ def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings,
     audit(db, "search_finished", job.user_id, job.user_id, run_id=run.id, status=status, errors=len(errors))
     if schedule:
         schedule.last_run_at=utcnow()
+    db.commit()
 
 
 def handle_cover_letter(db: Session, job: BackgroundJob, settings: Settings, runner) -> None:
@@ -491,7 +506,14 @@ def process_one(SessionLocal, settings: Settings, runner=None, adapter_factory=N
             job.status = "running"
             touch_job(db, job, progress=job.progress)
             if job.type == "scheduled_search":
-                handle_scheduled_search(db, job, effective, active_runner, adapter_factory)
+                handle_scheduled_search(
+                    db,
+                    job,
+                    effective,
+                    active_runner,
+                    adapter_factory,
+                    heartbeat=lambda progress=None: heartbeat_job(SessionLocal, job_id, worker_id, progress=progress),
+                )
             elif job.type in HANDLERS:
                 HANDLERS[job.type](db, job, effective, active_runner)
             else:

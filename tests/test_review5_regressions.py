@@ -13,7 +13,7 @@ from sqlalchemy import inspect, select
 from sqlalchemy.exc import IntegrityError
 
 from jobs_catcher.db import make_engine, make_session_factory, utcnow
-from jobs_catcher.models import AppSetting, BackgroundJob, ResumeFile, SourceHealth, User
+from jobs_catcher.models import AppSetting, BackgroundJob, CriteriaVersion, ProfileVersion, ResumeFile, SourceHealth, User, UserSchedule
 from jobs_catcher.settings import Settings
 from jobs_catcher.source_adapters import ADAPTERS
 from jobs_catcher.source_adapters.base import VacancyResult
@@ -186,3 +186,32 @@ def test_review5_invalid_admin_settings_do_not_persist_or_break_effective_settin
         assert values['http_timeout_seconds'] == 5.0
         assert values['codex_bin'] == 'python3'
     assert c.get('/admin/settings').status_code == 200
+
+
+def test_review5_web_write_can_commit_during_source_search_stage(tmp_path):
+    from jobs_catcher import criteria as criteria_mod
+    settings = st(tmp_path); create_app(settings=settings)
+    SessionLocal = make_session_factory(make_engine(settings.database_url))
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.login == 'admin'))
+        profile = ProfileVersion(user_id=user.id, version=1, data_json=json.dumps({'professional_title':'Ops','onboarding':{}}, ensure_ascii=False), confirmed=True)
+        db.add(profile); db.flush()
+        db.add(CriteriaVersion(user_id=user.id, profile_version_id=profile.id, version=1, data_json=json.dumps(criteria_mod.DEFAULT_CRITERIA, ensure_ascii=False)))
+        db.add(UserSchedule(user_id=user.id, interval_days=1, run_time='09:00', timezone='Europe/Amsterdam', sources_json=json.dumps(['hh']), preferences_json='{}'))
+        db.add(BackgroundJob(user_id=user.id, type='scheduled_search', status='queued', payload_json='{}', max_attempts=1))
+        db.commit()
+
+    class ConcurrentWriteAdapter:
+        def search(self, query, preferences):
+            with SessionLocal() as other:
+                other.add(AppSetting(key='concurrent_write_probe', value_json=json.dumps('ok')))
+                other.commit()
+            return []
+        def close(self):
+            pass
+
+    assert process_one(SessionLocal, settings, runner=object(), adapter_factory=lambda source: ConcurrentWriteAdapter())
+    with SessionLocal() as db:
+        assert json.loads(db.get(AppSetting, 'concurrent_write_probe').value_json) == 'ok'
+        job = db.scalar(select(BackgroundJob))
+        assert job.status == 'completed'
