@@ -35,6 +35,17 @@ class SourceAdapter:
     search_link_patterns: tuple[str, ...] = ()
     detail_title_pattern = r"<h1[^>]*>(.*?)</h1>"
     detail_company_patterns: tuple[str, ...] = (r"data-company=[\"']([^\"']+)[\"']", r"class=[\"'][^\"']*company[^\"']*[\"'][^>]*>(.*?)<")
+    detail_location_patterns: tuple[str, ...] = ()
+    detail_description_patterns: tuple[str, ...] = ()
+    detail_salary_patterns: tuple[str, ...] = ()
+    detail_work_format_patterns: tuple[str, ...] = ()
+    detail_employment_patterns: tuple[str, ...] = ()
+    detail_published_patterns: tuple[str, ...] = ()
+    detail_updated_patterns: tuple[str, ...] = ()
+    detail_requirements_patterns: tuple[str, ...] = ()
+    detail_responsibilities_patterns: tuple[str, ...] = ()
+    detail_conditions_patterns: tuple[str, ...] = ()
+    detail_skills_patterns: tuple[str, ...] = ()
     def __init__(self, settings: Settings, client: httpx.Client | None = None, *, sleeper=time.sleep, random_func=random.random) -> None:
         self.settings = settings
         self.client = client or httpx.Client(timeout=settings.http_timeout_seconds, follow_redirects=True, headers={"User-Agent": "JobsCatcher/1.0"})
@@ -128,6 +139,29 @@ class SourceAdapter:
         meta = re.search(rf'<meta[^>]+(?:name|property)=["\'][^"\']*{re.escape(field)}[^"\']*["\'][^>]+content=["\']([^"\']+)["\']', html_text, re.I | re.S)
         return self._clean(meta.group(1)) if meta else ""
 
+    def _first_text(self, html_text: str, patterns: tuple[str, ...]) -> str:
+        for pattern in patterns:
+            match = re.search(pattern, html_text, re.I | re.S)
+            if match:
+                return self._clean(match.group(1))
+        return ""
+
+    def _all_text(self, html_text: str, patterns: tuple[str, ...]) -> list[str]:
+        values: list[str] = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, html_text, re.I | re.S):
+                value = self._clean(match.group(1))
+                if value and value not in values:
+                    values.append(value)
+        return values
+
+    def _first_datetime(self, html_text: str, patterns: tuple[str, ...]) -> str | None:
+        for pattern in patterns:
+            match = re.search(pattern, html_text, re.I | re.S)
+            if match:
+                return self._clean(match.group(1)) or None
+        return None
+
     def _field_datetime(self, html_text: str, field: str) -> str | None:
         match = re.search(rf'<time[^>]+data-field=["\']{re.escape(field)}["\'][^>]+datetime=["\']([^"\']+)["\']', html_text, re.I | re.S)
         if match:
@@ -145,6 +179,25 @@ class SourceAdapter:
             return [x.strip() for x in re.split(r'[,;•]', text) if x.strip()]
         meta = self._field_text(html_text, field)
         return [x.strip() for x in re.split(r'[,;•]', meta) if x.strip()] if meta else []
+
+    def _parse_salary_text(self, text: str) -> dict | None:
+        if not text:
+            return None
+        nums = [int(re.sub(r"\D+", "", value)) for value in re.findall(r"\d[\d\s]{3,}", text)]
+        salary: dict = {}
+        if nums:
+            salary["from"] = nums[0]
+        if len(nums) > 1:
+            salary["to"] = nums[1]
+        if re.search(r"руб|₽|rub", text, re.I):
+            salary["currency"] = "RUB"
+        if re.search(r"net|на руки|после", text, re.I):
+            salary["gross"] = False
+        elif re.search(r"gross|до вычета|до налог", text, re.I):
+            salary["gross"] = True
+        elif salary:
+            salary["gross"] = None
+        return salary or None
 
     def _field_salary(self, html_text: str) -> dict | None:
         tag = re.search(r'<[^>]+data-field=["\']salary["\'][^>]*>', html_text, re.I | re.S)
@@ -164,33 +217,31 @@ class SourceAdapter:
             gross = attr("gross")
             if gross is not None:
                 salary["gross"] = gross.lower() in {"1", "true", "yes", "on"}
-            return salary or None
-        text = self._field_text(html_text, "salary")
-        if not text:
-            return None
-        nums = [int(re.sub(r'\D+', '', x)) for x in re.findall(r'\d[\d\s]{3,}', text)]
-        salary = {}
-        if nums:
-            salary["from"] = nums[0]
-        if len(nums) > 1:
-            salary["to"] = nums[1]
-        if re.search(r'руб|₽|rub', text, re.I):
-            salary["currency"] = "RUB"
-        if salary:
-            salary["gross"] = not bool(re.search(r'net|на руки|после', text, re.I))
-        return salary or None
+            if salary:
+                return salary
+            return self._parse_salary_text(self._field_text(html_text, "salary"))
+        return self._parse_salary_text(self._field_text(html_text, "salary"))
 
     def extract_metadata(self, html_text: str) -> dict:
+        salary_text = self._first_text(html_text, self.detail_salary_patterns)
         return {
-            "salary": self._field_salary(html_text),
-            "work_format": self._field_text(html_text, "work_format"),
-            "employment_type": self._field_text(html_text, "employment_type"),
-            "published_at": self._field_datetime(html_text, "published_at"),
-            "updated_at": self._field_datetime(html_text, "updated_at"),
-            "requirements": self._field_text(html_text, "requirements"),
-            "responsibilities": self._field_text(html_text, "responsibilities"),
-            "conditions": self._field_text(html_text, "conditions"),
-            "skills": self._field_list(html_text, "skills"),
+            "salary": self._parse_salary_text(salary_text) if salary_text else self._field_salary(html_text),
+            "work_format": self._first_text(html_text, self.detail_work_format_patterns)
+            or self._field_text(html_text, "work_format"),
+            "employment_type": self._first_text(html_text, self.detail_employment_patterns)
+            or self._field_text(html_text, "employment_type"),
+            "published_at": self._first_datetime(html_text, self.detail_published_patterns)
+            or self._field_datetime(html_text, "published_at"),
+            "updated_at": self._first_datetime(html_text, self.detail_updated_patterns)
+            or self._field_datetime(html_text, "updated_at"),
+            "requirements": self._first_text(html_text, self.detail_requirements_patterns)
+            or self._field_text(html_text, "requirements"),
+            "responsibilities": self._first_text(html_text, self.detail_responsibilities_patterns)
+            or self._field_text(html_text, "responsibilities"),
+            "conditions": self._first_text(html_text, self.detail_conditions_patterns)
+            or self._field_text(html_text, "conditions"),
+            "skills": self._all_text(html_text, self.detail_skills_patterns)
+            or self._field_list(html_text, "skills"),
         }
 
     def parse_search_page(self, html_text: str) -> list[VacancyResult]:
@@ -224,11 +275,13 @@ class SourceAdapter:
             if m:
                 result.company = self._clean(m.group(1))
                 break
-        location = self._field_text(html_text, "location")
+        location = self._first_text(html_text, self.detail_location_patterns) or self._field_text(
+            html_text, "location"
+        )
         if location:
             result.location = location
-        body_text = self._clean(html_text)
-        result.description = body_text
+        description = self._first_text(html_text, self.detail_description_patterns)
+        result.description = description or self._field_text(html_text, "description")
         meta = dict(result.raw or {})
         meta.update(self.extract_metadata(html_text))
         meta.update({"parser": self.source, "description_source": "detail"})

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib, json, time
+import hashlib, json, os, socket, time, uuid
 from datetime import datetime, time as dt_time, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -123,6 +123,32 @@ def touch_job(db: Session, job: BackgroundJob, *, progress: int | None = None, l
     db.flush()
 
 
+def heartbeat_job(SessionLocal, job_id: int, worker_id: str, *, progress: int | None = None, lease_seconds: int = 900) -> bool:
+    now = utcnow()
+    values = {
+        "heartbeat_at": now,
+        "lease_expires_at": now + timedelta(seconds=lease_seconds),
+    }
+    if progress is not None:
+        values["progress"] = progress
+    with SessionLocal() as db:
+        result = db.execute(
+            update(BackgroundJob)
+            .where(
+                BackgroundJob.id == job_id,
+                BackgroundJob.worker_id == worker_id,
+                BackgroundJob.status.in_(queue.ACTIVE_STATUSES - {"queued"}),
+            )
+            .values(**values)
+        )
+        db.commit()
+        return result.rowcount == 1
+
+
+def make_worker_id() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+
+
 def recover_stale_jobs(db: Session, stale_after_seconds: int = 900) -> int:
     now = utcnow()
     threshold = now - timedelta(seconds=stale_after_seconds)
@@ -130,7 +156,7 @@ def recover_stale_jobs(db: Session, stale_after_seconds: int = 900) -> int:
     count = 0
     for job in jobs:
         lease_expired = bool(job.lease_expires_at and job.lease_expires_at <= now)
-        heartbeat_stale = bool((not job.heartbeat_at) or job.heartbeat_at < threshold)
+        heartbeat_stale = bool((not job.lease_expires_at) and ((not job.heartbeat_at) or job.heartbeat_at < threshold))
         if lease_expired or heartbeat_stale:
             job.status = "queued"
             job.worker_id = None
@@ -145,7 +171,7 @@ def claim_next_job(db: Session, worker_id: str | None = None, lease_seconds: int
     if candidate_id is None:
         return None
     now = utcnow()
-    worker_id = worker_id or "worker"
+    worker_id = worker_id or make_worker_id()
     result = db.execute(
         update(BackgroundJob)
         .where(BackgroundJob.id == candidate_id, BackgroundJob.status == "queued")
@@ -445,19 +471,23 @@ HANDLERS = {"resume_profile_extraction": handle_profile_extraction, "criteria_ge
 
 
 def process_one(SessionLocal, settings: Settings, runner=None, adapter_factory=None) -> bool:
+    worker_id = make_worker_id()
     with SessionLocal() as db:
         recover_stale_jobs(db)
-        job = claim_next_job(db, worker_id="worker")
+        job = claim_next_job(db, worker_id=worker_id)
         if not job:
             db.commit()
             return False
+        job_id = job.id
         db.commit()
     with SessionLocal() as db:
         effective = settings_from_db(db, settings)
         active_runner = runner or CodexRunner(effective)
         cleanup_old_run_artifacts(effective)
-        job = db.get(BackgroundJob, job.id)
+        job = db.get(BackgroundJob, job_id)
         try:
+            if not job or job.worker_id != worker_id:
+                return True
             job.status = "running"
             touch_job(db, job, progress=job.progress)
             if job.type == "scheduled_search":
@@ -466,15 +496,39 @@ def process_one(SessionLocal, settings: Settings, runner=None, adapter_factory=N
                 HANDLERS[job.type](db, job, effective, active_runner)
             else:
                 raise RuntimeError(f"unknown job type {job.type}")
-            job.status="completed"; job.progress=100; job.technical_error=None; job.finished_at=utcnow(); job.active_key=None; job.worker_id=None; job.lease_expires_at=None; db.commit(); return True
+            result = db.execute(
+                update(BackgroundJob)
+                .where(BackgroundJob.id == job_id, BackgroundJob.worker_id == worker_id)
+                .values(
+                    status="completed",
+                    progress=100,
+                    technical_error=None,
+                    finished_at=utcnow(),
+                    active_key=None,
+                    worker_id=None,
+                    lease_expires_at=None,
+                )
+            )
+            if result.rowcount != 1:
+                db.rollback()
+                return True
+            db.commit()
+            return True
         except Exception as exc:
-            job.technical_error = str(exc)[:1000]
-            job.status = "queued" if job.attempts < job.max_attempts else "failed"
-            job.finished_at = utcnow() if job.status == "failed" else None
-            job.active_key=None if job.status in {"failed","completed"} else job.active_key
-            job.worker_id=None; job.lease_expires_at=None
-            audit(db, "job_error", job.user_id, job.user_id, job_id=job.id, error=str(exc)[:500])
-            db.commit(); return True
+            db.rollback()
+            message = str(exc)[:1000]
+            with SessionLocal() as fail_db:
+                failed = fail_db.get(BackgroundJob, job_id)
+                if failed and failed.worker_id == worker_id:
+                    failed.technical_error = message
+                    failed.status = "queued" if failed.attempts < failed.max_attempts else "failed"
+                    failed.finished_at = utcnow() if failed.status == "failed" else None
+                    failed.active_key = None if failed.status in {"failed", "completed"} else failed.active_key
+                    failed.worker_id = None
+                    failed.lease_expires_at = None
+                    audit(fail_db, "job_error", failed.user_id, failed.user_id, job_id=failed.id, error=message[:500])
+                fail_db.commit()
+            return True
 
 
 def schedule_due_jobs(SessionLocal, settings: Settings, *, now: datetime | None = None) -> int:

@@ -1,1 +1,1 @@
-{% extends "base.html" %}{% block body %}<h1>Dashboard</h1><p>Jobs: {{ jobs }}</p><p>Vacancies: {{ scores }}</p><p><a href="/admin/jobs">Jobs</a> <a href="/admin/runs">Runs</a> <a href="/admin/source-health">Source health</a> <a href="/admin/audit">Audit</a></p>{% endblock %}
+{% extends "base.html" %}{% block body %}<h1>Dashboard</h1><p>Jobs: {{ jobs }}</p><p>Vacancies: {{ scores }}</p>{% if is_admin %}<p><a href="/admin/jobs">Jobs</a> <a href="/admin/runs">Runs</a> <a href="/admin/source-health">Source health</a> <a href="/admin/audit">Audit</a></p>{% endif %}{% endblock %}

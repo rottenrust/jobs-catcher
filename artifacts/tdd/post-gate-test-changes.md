@@ -43,3 +43,21 @@ Adapters use polite sequential HTML fetching in production and fixtures in CI. C
 
 ## Screenshots
 Placeholders: `docs/screenshots/login.png`, `dashboard.png`, `vacancies.png`, `admin.png`.
+
+
+## Review 5 Regression Additions
+
+Date: 2026-07-08
+Reason: owner review #5 identified P0/P1 regressions not covered strongly enough by existing tests. These tests tighten assertions and do not weaken prior coverage.
+
+Added `tests/test_review5_regressions.py` covering:
+- per-source detail fixtures with different HTML structures and exact rich-field assertions;
+- salary text without explicit gross/net preserving `gross = null`;
+- heartbeat visibility from a second session and lease-based stale recovery;
+- failed final resume rename leaving no active DB row/job/orphan file;
+- historical `0001_initial` schema, `0002` upgrade, downgrade/re-upgrade, and fresh/upgraded head schema equality;
+- `.env.example` placeholder `SESSION_SECRET` rejection in production;
+- worker handler DB exception rollback with separate job failure transaction;
+- invalid admin settings returning 400 without persisting bad overrides.
+
+Why this does not weaken tests: all new assertions are stricter regression checks for previously accepted behavior; no skips, xfails, broad mocks, or lowered expectations were added.

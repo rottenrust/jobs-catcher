@@ -60,16 +60,6 @@ def upgrade():
         sa.Column('company', sa.String(500), nullable=False, default=''),
         sa.Column('location', sa.String(255), nullable=False, default=''),
         sa.Column('description', sa.String(), nullable=False, default=''),
-        sa.Column('work_format', sa.String(80), nullable=False, default=''),
-        sa.Column('employment_type', sa.String(120), nullable=False, default=''),
-        sa.Column('salary_json', sa.String(), nullable=False, default='{}'),
-        sa.Column('published_at', sa.String(40), nullable=False, default=''),
-        sa.Column('updated_at', sa.String(40), nullable=False, default=''),
-        sa.Column('requirements', sa.String(), nullable=False, default=''),
-        sa.Column('responsibilities', sa.String(), nullable=False, default=''),
-        sa.Column('conditions', sa.String(), nullable=False, default=''),
-        sa.Column('skills_json', sa.String(), nullable=False, default='[]'),
-        sa.Column('normalized_json', sa.String(), nullable=False, default='{}'),
         sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     )
     op.create_index("ix_vacancies_content_hash", "vacancies", ['content_hash'], unique=False)

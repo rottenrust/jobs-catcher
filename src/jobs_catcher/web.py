@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -24,7 +25,7 @@ from .models import (
 )
 from .settings import Settings, load_settings
 from .worker import compute_next_run_at, validate_run_time, validate_timezone
-from .settings_effective import load_effective_settings, validate_runtime_settings
+from .settings_effective import build_effective_settings, load_effective_settings, validate_runtime_settings
 
 class Store:  # compatibility shim for old tests; production uses Settings/DB only.
     def __init__(self, database_url: str | None = None, upload_dir: Path | None = None, data_dir: Path | None = None):
@@ -72,6 +73,9 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
     app.state.settings = settings
     app.state.engine = engine
     app.state.SessionLocal = SessionLocal
+    static_dir = Path(__file__).with_name("static")
+    if static_dir.exists():
+        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts) + ["testserver"])
 
     def db_session() -> Session:
@@ -92,6 +96,8 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
         if not user or user.deleted_at is not None:
             db.execute(delete(UserSession).where(UserSession.token_hash == token_hash)); db.commit()
             raise HTTPException(401)
+        request.state.user_role = user.role
+        request.state.user_id = user.id
         if user.must_change_password and request.url.path not in {"/change-password", "/logout"}:
             raise HTTPException(403, "password change required")
         return user, token or ""
@@ -116,6 +122,10 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
 
     def csrf_input(token: str) -> str:
         return f'<input type="hidden" name="csrf" value="{escape(auth.csrf_token(token))}">'
+
+    def wants_html(request: Request) -> bool:
+        accept = request.headers.get("accept", "")
+        return "text/html" in accept and "application/json" not in accept
 
     def enqueue(db: Session, user_id: int | None, job_type: str, payload: dict, active_key: str | None = None) -> BackgroundJob:
         if active_key:
@@ -342,15 +352,18 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
                 db.add(resume); db.flush()
                 enqueue(db, user.id, "resume_profile_extraction", {"resume_file_id": resume.id})
                 audit(db, "resume_uploaded", user.id, user.id, request, filename=check.safe_name, sha256=check.sha256)
-                db.commit()
                 tmp_path.replace(path)
-            except Exception:
+                db.commit()
+            except Exception as exc:
                 db.rollback()
                 tmp_path.unlink(missing_ok=True)
-                raise
+                path.unlink(missing_ok=True)
+                raise HTTPException(500, "resume upload failed") from exc
             for old in old_paths:
                 try: old.unlink(missing_ok=True)
                 except Exception: pass
+            if wants_html(request):
+                return RedirectResponse("/profile", status_code=303)
             return {"id": resume.id, "kind": check.kind, "sha256": check.sha256, "stored": stored_name}
 
     @app.post("/onboarding")
@@ -367,12 +380,20 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             data["relocation"] = str(form.get("relocation", "")).lower() in {"true", "on", "1", "yes"}
             if "gross" in data:
                 data["gross"] = str(form.get("gross", "")).lower() in {"true", "on", "1", "yes"}
+            if data.get("salary_minimum") not in {None, ""}:
+                try:
+                    data["salary_minimum"] = int(str(data["salary_minimum"]).replace(" ", ""))
+                except ValueError as exc:
+                    raise HTTPException(400, "salary_minimum must be a number") from exc
             latest = db.scalar(select(ProfileVersion).where(ProfileVersion.user_id == user.id).order_by(ProfileVersion.version.desc()))
             profile = loads(latest.data_json) if latest else {"professional_title": (data.get("desired_titles") or ["Профиль"])[0], "facts_for_applications": []}
             profile["onboarding"] = data
             version = (latest.version if latest else 0) + 1
             pv = ProfileVersion(user_id=user.id, resume_file_id=latest.resume_file_id if latest else None, version=version, data_json=dumps(profile), confirmed=False)
-            db.add(pv); audit(db, "onboarding_saved", user.id, user.id, request); db.commit(); return profile
+            db.add(pv); audit(db, "onboarding_saved", user.id, user.id, request); db.commit()
+            if wants_html(request):
+                return RedirectResponse("/profile", status_code=303)
+            return profile
 
 
     @app.post("/profile")
@@ -402,7 +423,10 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             audit(db, "profile_confirmed", user.id, user.id, request, profile_version_id=profile.id)
             # criteria generation job, handled by worker; also create fallback criteria for immediate editability
             enqueue(db, user.id, "criteria_generation", {"profile_version_id": profile.id})
-            db.commit(); return {"confirmed": True, "profile_version_id": profile.id}
+            db.commit()
+            if wants_html(request):
+                return RedirectResponse("/criteria", status_code=303)
+            return {"confirmed": True, "profile_version_id": profile.id}
 
     @app.post("/criteria")
     async def save_criteria(request: Request):
@@ -426,7 +450,10 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             profile = db.scalar(select(ProfileVersion).where(ProfileVersion.user_id == user.id, ProfileVersion.confirmed == True).order_by(ProfileVersion.version.desc()))
             version = (latest.version if latest else 0) + 1
             cv = CriteriaVersion(user_id=user.id, profile_version_id=profile.id if profile else None, version=version, data_json=dumps(valid))
-            db.add(cv); audit(db, "criteria_changed", user.id, user.id, request, version=version); db.commit(); return {"version": version, "id": cv.id}
+            db.add(cv); audit(db, "criteria_changed", user.id, user.id, request, version=version); db.commit()
+            if wants_html(request):
+                return RedirectResponse("/schedule", status_code=303)
+            return {"version": version, "id": cv.id}
 
     @app.post("/schedule")
     def schedule(request: Request, interval_days: int = Form(...), sources: str = Form("hh,habr,superjob,rabota,geekjob,getmatch"), run_time: str = Form("09:00"), timezone: str = Form("Europe/Moscow"), csrf: str | None = Form(None)):
@@ -445,7 +472,10 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             if not sched:
                 sched = UserSchedule(user_id=user.id, interval_days=interval_days, sources_json=dumps(selected)); db.add(sched)
             sched.interval_days = interval_days; sched.sources_json = dumps(selected); sched.run_time = run_time; sched.timezone = timezone; sched.next_run_at = compute_next_run_at(interval_days, run_time, timezone, now=utcnow())
-            audit(db, "schedule_changed", user.id, user.id, request); db.commit(); return {"interval_days": interval_days, "sources": selected}
+            audit(db, "schedule_changed", user.id, user.id, request); db.commit()
+            if wants_html(request):
+                return RedirectResponse("/dashboard", status_code=303)
+            return {"interval_days": interval_days, "sources": selected}
 
     @app.get("/vacancies", response_class=HTMLResponse)
     def vacancies(request: Request, decision: str | None = None, hide_viewed: bool = False):
@@ -493,7 +523,10 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             user, token = current_user(db, request); require_csrf(request, token, csrf)
             if not db.scalar(select(VacancyScore).where(VacancyScore.user_id == user.id, VacancyScore.vacancy_id == vid)): raise HTTPException(404)
             job = enqueue(db, user.id, "generate_cover_letter", {"vacancy_id": vid})
-            audit(db, "letter_requested", user.id, user.id, request, vacancy_id=vid); db.commit(); return {"job_id": job.id}
+            audit(db, "letter_requested", user.id, user.id, request, vacancy_id=vid); db.commit()
+            if wants_html(request):
+                return RedirectResponse(f"/vacancies/{vid}?letter_job_id={job.id}", status_code=303)
+            return {"job_id": job.id}
 
     def wants_json(request: Request) -> bool:
         return request.query_params.get("format") == "json" or ("application/json" in request.headers.get("accept", "") and "text/html" not in request.headers.get("accept", ""))
@@ -551,14 +584,18 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
         with db_session() as db:
             admin, token = require_admin(db, request); require_csrf(request, token, csrf)
             selected = [src.strip() for src in enabled_sources.split(",") if src.strip() in {"hh", "habr", "superjob", "rabota", "geekjob", "getmatch"}]
-            if not selected or min_schedule_interval_days < 1 or max_results_per_source < 1 or max_schedule_interval_days < min_schedule_interval_days:
-                raise HTTPException(400)
             payload = {"enabled_sources": selected, "min_schedule_interval_days": min_schedule_interval_days, "max_schedule_interval_days": max_schedule_interval_days, "timezone": timezone, "http_delay_seconds": http_delay_seconds, "http_jitter_seconds": http_jitter_seconds, "http_timeout_seconds": http_timeout_seconds, "http_retries": http_retries, "max_search_queries": max_search_queries, "max_results_per_source": max_results_per_source, "max_vacancies_per_run": max_vacancies_per_run, "max_llm_candidates": max_llm_candidates, "codex_batch_size": codex_batch_size, "codex_bin": codex_bin, "resume_size_limit": resume_size_limit, "artifact_retention_days": artifact_retention_days, "global_search_enabled": bool(global_search_enabled)}
+            try:
+                build_effective_settings(settings, payload)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
             for key, value in payload.items():
                 row = db.get(AppSetting, key) or AppSetting(key=key, value_json="null")
                 row.value_json = dumps(value); row.updated_at = utcnow(); db.add(row)
             audit(db, "settings_changed", admin.id, None, request, keys=list(payload))
             db.commit()
+            if wants_html(request):
+                return RedirectResponse("/admin/settings", status_code=303)
             return {"saved": True, **payload}
 
     @app.get("/dashboard", response_class=HTMLResponse)
@@ -567,6 +604,6 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             user, _ = current_user(db, request)
             jobs = db.scalar(select(func.count(BackgroundJob.id)).where(BackgroundJob.user_id == user.id, BackgroundJob.status.in_(queue.ACTIVE_STATUSES)))
             scores = db.scalar(select(func.count(VacancyScore.id)).where(VacancyScore.user_id == user.id))
-            return templates.TemplateResponse(request, "dashboard.html", {"title": "Dashboard", "jobs": jobs, "scores": scores})
+            return templates.TemplateResponse(request, "dashboard.html", {"title": "Dashboard", "jobs": jobs, "scores": scores, "is_admin": user.role == "superuser"})
 
     return app

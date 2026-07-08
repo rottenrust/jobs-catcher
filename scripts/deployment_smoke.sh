@@ -8,10 +8,11 @@ ENV_FILE=${ENV_FILE:-$ROOT/etc/jobs-catcher.env}
 SYSTEMD_DIR=${SYSTEMD_DIR:-$ROOT/etc/systemd/system}
 FAKE_BIN="$ROOT/bin"
 mkdir -p "$FAKE_BIN" "$DATA_DIR/uploads" "$DATA_DIR/runs" "$(dirname "$ENV_FILE")" "$SYSTEMD_DIR"
+SESSION_SECRET=${SESSION_SECRET:-$(${PYTHON_BIN:-python3} -c 'import secrets; print(secrets.token_hex(32))')}
 cat >"$ENV_FILE" <<ENV
 APP_BASE_URL=http://127.0.0.1:8000
 ALLOWED_HOSTS=127.0.0.1,localhost,testserver
-SESSION_SECRET=deployment-smoke-secret-not-production-12345
+SESSION_SECRET=$SESSION_SECRET
 DATABASE_URL=sqlite:///$DATA_DIR/jobs-catcher.sqlite3
 DATA_DIR=$DATA_DIR
 UPLOAD_DIR=$DATA_DIR/uploads
