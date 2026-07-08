@@ -8,6 +8,17 @@ class GetMatchAdapter(SourceAdapter):
     path = "/vacancies"
     query_param = "query"
     search_link_patterns = (r'<a[^>]+href=["\']([^"\']*/getmatch/vacancies/[^"\']+)["\'][^>]*>(.*?)</a>',)
-    defaults = {**SourceAdapter.defaults, "work_format":"remote", "salary":{"from":150000,"to":250000,"currency":"RUB","gross":True}, "skills":["agents", "rag"]}
     def build_search_url(self, query, preferences, page=0):
-        return f"{self.base_url}{self.path}?{urlencode({'query': query, 'page': page + 1})}"
+        params = {"query": query, "page": page + 1}
+        if preferences.get("locations") and not preferences.get("all_russia"):
+            params["city"] = ",".join(preferences["locations"])
+        if preferences.get("remote") or "remote" in preferences.get("work_formats", []):
+            params["remote"] = "remote"
+        if preferences.get("employment_types"):
+            params["employment"] = ",".join(preferences["employment_types"])
+        salary = preferences.get("salary") or {}
+        if salary.get("minimum"):
+            params["salary"] = str(salary["minimum"])
+        if preferences.get("seniority"):
+            params["grade"] = ",".join(preferences["seniority"])
+        return f"{self.base_url}{self.path}?{urlencode(params)}"

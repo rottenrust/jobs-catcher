@@ -7,6 +7,12 @@ from argon2.exceptions import VerifyMismatchError, VerificationError
 
 OBVIOUS_PASSWORDS = {"admin", "password", "password123", "qwerty123456", "123456789012", "letmein123456"}
 _ph = PasswordHasher()
+_secret = b""
+
+
+def configure_secret(secret: str) -> None:
+    global _secret
+    _secret = (secret or "").encode()
 
 @dataclass(frozen=True)
 class Session:
@@ -37,7 +43,10 @@ def verify_password(hash_value: str, password: str) -> bool:
 
 
 def hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
+    payload = token.encode()
+    if _secret:
+        return hmac.new(_secret, payload, hashlib.sha256).hexdigest()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def new_session(user_id: int) -> tuple[str, Session]:
@@ -46,7 +55,8 @@ def new_session(user_id: int) -> tuple[str, Session]:
 
 
 def csrf_token(session_token: str) -> str:
-    return hmac.new(session_token.encode(), b"csrf", hashlib.sha256).hexdigest()
+    key = _secret or session_token.encode()
+    return hmac.new(key, ("csrf:" + session_token).encode(), hashlib.sha256).hexdigest()
 
 
 def verify_csrf(session_token: str, csrf_value: str) -> bool:

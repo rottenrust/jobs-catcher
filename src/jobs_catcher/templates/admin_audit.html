@@ -1,0 +1,1 @@
+{% extends "base.html" %}{% block body %}<h1>Audit</h1><table><thead><tr><th>Time</th><th>Action</th><th>Actor</th><th>Target</th><th>Metadata</th></tr></thead><tbody>{% for r in rows %}<tr><td>{{ r.created_at }}</td><td>{{ r.action }}</td><td>{{ r.actor_id }}</td><td>{{ r.target_user_id }}</td><td>{{ r.metadata }}</td></tr>{% endfor %}</tbody></table>{% endblock %}

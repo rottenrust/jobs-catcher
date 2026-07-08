@@ -9,7 +9,9 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from sqlalchemy import delete, func, select, update
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -21,7 +23,8 @@ from .models import (
     UserSession, Vacancy, VacancyScore, VacancySource, VacancyUIState,
 )
 from .settings import Settings, load_settings
-from .worker import compute_next_run_at, settings_from_db, validate_run_time, validate_timezone
+from .worker import compute_next_run_at, validate_run_time, validate_timezone
+from .settings_effective import load_effective_settings, validate_runtime_settings
 
 class Store:  # compatibility shim for old tests; production uses Settings/DB only.
     def __init__(self, database_url: str | None = None, upload_dir: Path | None = None, data_dir: Path | None = None):
@@ -40,6 +43,7 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
         settings = store.settings if store is not None else load_settings()
     if production is not None:
         settings = Settings(**{**settings.__dict__, "environment": "production" if production else settings.environment})
+    auth.configure_secret(settings.session_secret)
     settings.ensure_dirs()
     engine = make_engine(settings.database_url)
     if settings.production and settings.database_url != "sqlite:///:memory:":
@@ -48,11 +52,18 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             with SessionLocal() as db:
                 db.execute(select(func.count(User.id))).scalar()
                 db.execute(select(func.count()).select_from(AppSetting)).scalar()
+                current_revision = db.execute(text("select version_num from alembic_version")).scalar()
+                cfg = Config(str(Path(__file__).parents[2] / "alembic.ini"))
+                head_revision = ScriptDirectory.from_config(cfg).get_current_head()
+                if current_revision != head_revision:
+                    raise RuntimeError(f"database revision {current_revision} is not head {head_revision}")
         except Exception as exc:
             raise RuntimeError("database is not migrated; run alembic upgrade head before production startup") from exc
+        validate_runtime_settings(settings)
     else:
         create_schema(engine)
         SessionLocal = make_session_factory(engine)
+        validate_runtime_settings(settings)
     with SessionLocal() as db:
         bootstrap_admin(db)
 
@@ -91,7 +102,7 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             raise HTTPException(403, "CSRF")
 
     def effective_settings(db: Session) -> Settings:
-        return settings_from_db(db, settings)
+        return load_effective_settings(db, settings)
 
     def require_admin(db: Session, request: Request) -> tuple[User, str]:
         user, token = current_user(db, request)
@@ -140,14 +151,17 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
 
     @app.get("/health/ready")
     def ready():
-        checks = {"db": False, "data_dir": False, "upload_dir": False, "codex_bin": bool(shutil.which(settings.codex_bin) or Path(settings.codex_bin).exists())}
+        eff = settings
+        checks = {"db": False, "data_dir": False, "upload_dir": False, "codex_bin": False}
         try:
             with db_session() as db:
                 db.execute(select(func.count(User.id))).scalar()
+                eff = effective_settings(db)
             checks["db"] = True
         except Exception:
             checks["db"] = False
-        for key, path in [("data_dir", settings.data_dir), ("upload_dir", settings.upload_dir)]:
+        checks["codex_bin"] = bool(shutil.which(eff.codex_bin) or Path(eff.codex_bin).exists())
+        for key, path in [("data_dir", eff.data_dir), ("upload_dir", eff.upload_dir)]:
             try:
                 path.mkdir(parents=True, exist_ok=True)
                 probe = path / ".ready"
@@ -255,7 +269,7 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
         interval = sched.interval_days if sched else eff.min_schedule_interval_days
         sources = ",".join(loads(sched.sources_json, list(eff.enabled_sources)) if sched else eff.enabled_sources)
         run_time = sched.run_time if sched else "09:00"
-        tz = sched.timezone if sched else "Europe/Moscow"
+        tz = sched.timezone if sched else eff.timezone
         return templates.TemplateResponse(request, "schedule.html", {"title": "Schedule", "csrf": auth.csrf_token(token), "interval_days": interval, "sources": sources, "run_time": run_time, "timezone": tz})
 
     @app.get("/admin/users", response_class=HTMLResponse)
@@ -311,21 +325,29 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
         content = await file.read()
         with db_session() as db:
             user, token = current_user(db, request); require_csrf(request, token, csrf)
-            check = documents.validate_upload(file.filename or "", content, file.content_type or "", max_bytes=settings.resume_size_limit)
+            eff = effective_settings(db)
             try:
+                check = documents.validate_upload(file.filename or "", content, file.content_type or "", max_bytes=eff.resume_size_limit)
                 text = documents.extract_docx_text(content) if check.kind == "docx" else documents.extract_pdf_text(content)
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
             stored_name = f"{uuid.uuid4().hex}.{check.kind}"
-            path = settings.upload_dir / stored_name
-            path.write_bytes(content)
+            path = eff.upload_dir / stored_name
+            tmp_path = eff.upload_dir / f".{stored_name}.tmp"
+            tmp_path.write_bytes(content)
             old_paths = [Path(r.path) for r in db.scalars(select(ResumeFile).where(ResumeFile.user_id == user.id, ResumeFile.active == True)).all()]
-            db.execute(update(ResumeFile).where(ResumeFile.user_id == user.id).values(active=False))
-            resume = ResumeFile(user_id=user.id, original_name=check.original_name, stored_name=stored_name, mime=file.content_type or "", size=len(content), sha256=check.sha256, path=str(path), extracted_text=text, active=True)
-            db.add(resume); db.flush()
-            enqueue(db, user.id, "resume_profile_extraction", {"resume_file_id": resume.id})
-            audit(db, "resume_uploaded", user.id, user.id, request, filename=check.safe_name, sha256=check.sha256)
-            db.commit()
+            try:
+                db.execute(update(ResumeFile).where(ResumeFile.user_id == user.id).values(active=False))
+                resume = ResumeFile(user_id=user.id, original_name=check.original_name, stored_name=stored_name, mime=file.content_type or "", size=len(content), sha256=check.sha256, path=str(path), extracted_text=text, active=True)
+                db.add(resume); db.flush()
+                enqueue(db, user.id, "resume_profile_extraction", {"resume_file_id": resume.id})
+                audit(db, "resume_uploaded", user.id, user.id, request, filename=check.safe_name, sha256=check.sha256)
+                db.commit()
+                tmp_path.replace(path)
+            except Exception:
+                db.rollback()
+                tmp_path.unlink(missing_ok=True)
+                raise
             for old in old_paths:
                 try: old.unlink(missing_ok=True)
                 except Exception: pass
@@ -343,6 +365,8 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             data["remote"] = str(form.get("remote", "")).lower() in {"true", "on", "1", "yes"}
             data["all_russia"] = str(form.get("all_russia", "")).lower() in {"true", "on", "1", "yes"}
             data["relocation"] = str(form.get("relocation", "")).lower() in {"true", "on", "1", "yes"}
+            if "gross" in data:
+                data["gross"] = str(form.get("gross", "")).lower() in {"true", "on", "1", "yes"}
             latest = db.scalar(select(ProfileVersion).where(ProfileVersion.user_id == user.id).order_by(ProfileVersion.version.desc()))
             profile = loads(latest.data_json) if latest else {"professional_title": (data.get("desired_titles") or ["Профиль"])[0], "facts_for_applications": []}
             profile["onboarding"] = data
@@ -471,30 +495,45 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             job = enqueue(db, user.id, "generate_cover_letter", {"vacancy_id": vid})
             audit(db, "letter_requested", user.id, user.id, request, vacancy_id=vid); db.commit(); return {"job_id": job.id}
 
+    def wants_json(request: Request) -> bool:
+        return request.query_params.get("format") == "json" or ("application/json" in request.headers.get("accept", "") and "text/html" not in request.headers.get("accept", ""))
+
     @app.get("/admin/audit")
     def audit_log(request: Request):
         with db_session() as db:
             require_admin(db, request)
             rows = db.scalars(select(AuditLog).order_by(AuditLog.id.desc()).limit(200)).all()
-            return [{"action": r.action, "actor_id": r.actor_user_id, "target_user_id": r.target_user_id, "metadata": loads(r.metadata_json), "created_at": r.created_at.isoformat()} for r in rows]
+            data = [{"action": r.action, "actor_id": r.actor_user_id, "target_user_id": r.target_user_id, "metadata": loads(r.metadata_json), "created_at": r.created_at.isoformat()} for r in rows]
+            if wants_json(request):
+                return data
+            return templates.TemplateResponse(request, "admin_audit.html", {"title":"Audit", "rows": data})
 
     @app.get("/admin/jobs")
     def admin_jobs(request: Request):
         with db_session() as db:
             require_admin(db, request)
-            return [{"id": j.id, "type": j.type, "status": j.status, "attempts": j.attempts, "progress": j.progress} for j in db.scalars(select(BackgroundJob).order_by(BackgroundJob.id.desc()).limit(200))]
+            rows = [{"id": j.id, "type": j.type, "status": j.status, "attempts": j.attempts, "progress": j.progress, "error": j.technical_error} for j in db.scalars(select(BackgroundJob).order_by(BackgroundJob.id.desc()).limit(200))]
+            if wants_json(request):
+                return rows
+            return templates.TemplateResponse(request, "admin_jobs.html", {"title":"Jobs", "rows": rows})
 
     @app.get("/admin/runs")
     def admin_runs(request: Request):
         with db_session() as db:
             require_admin(db, request)
-            return [{"id": r.id, "user_id": r.user_id, "status": r.status, "average_prescore": r.average_prescore} for r in db.scalars(select(SearchRun).order_by(SearchRun.id.desc()).limit(100))]
+            rows = [{"id": r.id, "user_id": r.user_id, "status": r.status, "average_prescore": r.average_prescore, "summary": loads(r.summary_json)} for r in db.scalars(select(SearchRun).order_by(SearchRun.id.desc()).limit(100))]
+            if wants_json(request):
+                return rows
+            return templates.TemplateResponse(request, "admin_runs.html", {"title":"Runs", "rows": rows})
 
     @app.get("/admin/source-health")
     def admin_source_health(request: Request):
         with db_session() as db:
             require_admin(db, request)
-            return [{"source": s.source, "status": s.status, "last_error": s.last_error} for s in db.scalars(select(SourceHealth))]
+            rows = [{"source": s.source, "status": s.status, "last_error": s.last_error} for s in db.scalars(select(SourceHealth))]
+            if wants_json(request):
+                return rows
+            return templates.TemplateResponse(request, "admin_source_health.html", {"title":"Source Health", "rows": rows})
 
     @app.get("/admin/settings", response_class=HTMLResponse)
     def admin_settings(request: Request):
@@ -503,7 +542,7 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             values = {row.key: loads(row.value_json) for row in db.scalars(select(AppSetting)).all()}
             eff = effective_settings(db)
         enabled = ",".join(values.get("enabled_sources", list(eff.enabled_sources)))
-        context = {key: getattr(eff, key) for key in ["min_schedule_interval_days","max_schedule_interval_days","http_delay_seconds","http_jitter_seconds","http_timeout_seconds","http_retries","max_search_queries","max_results_per_source","max_vacancies_per_run","max_llm_candidates","codex_batch_size","codex_bin","resume_size_limit","artifact_retention_days","global_search_enabled"]}
+        context = {key: getattr(eff, key) for key in ["min_schedule_interval_days","max_schedule_interval_days","timezone","http_delay_seconds","http_jitter_seconds","http_timeout_seconds","http_retries","max_search_queries","max_results_per_source","max_vacancies_per_run","max_llm_candidates","codex_batch_size","codex_bin","resume_size_limit","artifact_retention_days","global_search_enabled"]}
         context.update({"title": "Admin Settings", "csrf": auth.csrf_token(token), "enabled_sources": enabled})
         return templates.TemplateResponse(request, "admin_settings.html", context)
 

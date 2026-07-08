@@ -4,6 +4,9 @@ APP_DIR=${APP_DIR:-/opt/jobs-catcher}
 DATA_DIR=${DATA_DIR:-/var/lib/jobs-catcher}
 ENV_FILE=${ENV_FILE:-/etc/jobs-catcher.env}
 RUNTIME_USER=${RUNTIME_USER:-jobscatcher}
+APP_USER=${APP_USER:-${SUDO_USER:-$(id -un)}}
+SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
+PYTHON_BIN=${PYTHON_BIN:-python3.12}
 SUDO=${SUDO:-sudo}
 
 load_env() {
@@ -19,19 +22,22 @@ load_env() {
 }
 
 run_as_runtime() { $SUDO -E -u "$RUNTIME_USER" "$@"; }
+run_as_app() { $SUDO -E -u "$APP_USER" "$@"; }
 
 if [[ "$(pwd)" != "$APP_DIR" ]]; then
   $SUDO mkdir -p "$APP_DIR"
+  $SUDO chown -R "$APP_USER:$APP_USER" "$APP_DIR"
   $SUDO rsync -a --delete --exclude .venv --exclude data --exclude uploads ./ "$APP_DIR"/
+  $SUDO chown -R "$APP_USER:$APP_USER" "$APP_DIR"
   cd "$APP_DIR"
 fi
 
 $SUDO useradd --system --home "$DATA_DIR" --shell /usr/sbin/nologin "$RUNTIME_USER" 2>/dev/null || true
 $SUDO mkdir -p "$DATA_DIR/uploads" "$DATA_DIR/runs"
 $SUDO chown -R "$RUNTIME_USER:$RUNTIME_USER" "$DATA_DIR"
-python3.12 -m venv "$APP_DIR/.venv"
-"$APP_DIR/.venv/bin/python" -m pip install --upgrade pip
-"$APP_DIR/.venv/bin/python" -m pip install -e "$APP_DIR"
+run_as_app "$PYTHON_BIN" -m venv "$APP_DIR/.venv"
+run_as_app "$APP_DIR/.venv/bin/python" -m pip install --upgrade pip
+run_as_app "$APP_DIR/.venv/bin/python" -m pip install -e "$APP_DIR"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   $SUDO install -m 640 -o root -g "$RUNTIME_USER" .env.example "$ENV_FILE"
@@ -40,7 +46,8 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 load_env
 
-$SUDO cp deploy/systemd/jobs-catcher-*.service /etc/systemd/system/
+$SUDO mkdir -p "$SYSTEMD_DIR"
+$SUDO cp deploy/systemd/jobs-catcher-*.service "$SYSTEMD_DIR"/
 $SUDO systemctl daemon-reload
 run_as_runtime "$APP_DIR/.venv/bin/alembic" -c "$APP_DIR/alembic.ini" upgrade head
 $SUDO systemctl enable jobs-catcher-web.service jobs-catcher-worker.service

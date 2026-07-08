@@ -46,7 +46,7 @@ def test_full_closed_multi_user_flow_and_isolation():
     assert bobc.get("/vacancies/999").status_code == 404
     assert bobc.post("/vacancies/999/letter", headers={"x-csrf-token":bcsrf}).status_code == 404
     admin=TestClient(app); csrf=login(admin,"admin","admin is now strong 42")
-    audit=admin.get("/admin/audit").json()
+    audit=admin.get("/admin/audit?format=json").json()
     actions={e["action"] for e in audit}
     assert {"login","user_created","resume_uploaded","profile_confirmed","schedule_changed"} <= actions
     assert admin.delete(f"/admin/users/{uid}", headers={"x-csrf-token":csrf}).status_code == 200

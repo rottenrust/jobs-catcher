@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import hashlib, json, time
-from dataclasses import replace
 from datetime import datetime, time as dt_time, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from . import codex_integration, criteria, scoring, queue
@@ -15,10 +14,11 @@ from .dedup import normalize_title
 from .models import (
     BackgroundJob, CoverLetter, CriteriaVersion, ProfileVersion, ResumeFile, SearchRun,
     SourceHealth, UserSchedule, Vacancy, VacancyScore, VacancySource, RunVacancy,
-    AppSetting,
+    AuditLog,
 )
 from .settings import Settings, load_settings
 from .source_adapters import ADAPTERS
+from .settings_effective import cleanup_old_run_artifacts, load_effective_settings
 
 
 def dumps(data) -> str:
@@ -29,24 +29,13 @@ def loads(text: str | None, default=None):
         return {} if default is None else default
     return json.loads(text)
 
-SETTINGS_KEYS = {
-    "enabled_sources", "min_schedule_interval_days", "max_schedule_interval_days",
-    "http_delay_seconds", "http_jitter_seconds", "http_timeout_seconds",
-    "http_retries", "max_search_queries", "max_results_per_source",
-    "max_vacancies_per_run", "max_llm_candidates", "codex_batch_size",
-    "resume_size_limit", "artifact_retention_days", "global_search_enabled", "codex_bin",
-}
-
 def settings_from_db(db: Session, base: Settings) -> Settings:
-    values = {}
-    for row in db.scalars(select(AppSetting)).all():
-        if row.key not in SETTINGS_KEYS:
-            continue
-        value = loads(row.value_json)
-        if row.key == "enabled_sources":
-            value = tuple(x for x in value if x in ADAPTERS)
-        values[row.key] = value
-    return replace(base, **values) if values else base
+    return load_effective_settings(db, base)
+
+
+def audit(db: Session, action: str, actor_id=None, target_user_id=None, **meta) -> None:
+    db.add(AuditLog(action=action, actor_user_id=actor_id, target_user_id=target_user_id, metadata_json=dumps(meta)))
+
 
 def validate_run_time(value: str) -> tuple[int, int]:
     try:
@@ -125,30 +114,114 @@ def enqueue_job(db: Session, user_id: int | None, job_type: str, payload: dict, 
     db.add(job); db.flush(); return job
 
 
+def touch_job(db: Session, job: BackgroundJob, *, progress: int | None = None, lease_seconds: int = 900) -> None:
+    now = utcnow()
+    job.heartbeat_at = now
+    job.lease_expires_at = now + timedelta(seconds=lease_seconds)
+    if progress is not None:
+        job.progress = progress
+    db.flush()
+
+
 def recover_stale_jobs(db: Session, stale_after_seconds: int = 900) -> int:
-    threshold = utcnow().timestamp() - stale_after_seconds
+    now = utcnow()
+    threshold = now - timedelta(seconds=stale_after_seconds)
     jobs = db.scalars(select(BackgroundJob).where(BackgroundJob.status.in_(queue.ACTIVE_STATUSES - {"queued"}))).all()
     count = 0
     for job in jobs:
-        if not job.heartbeat_at or job.heartbeat_at.timestamp() < threshold:
-            job.status = "queued"; job.attempts += 1; count += 1
+        lease_expired = bool(job.lease_expires_at and job.lease_expires_at <= now)
+        heartbeat_stale = bool((not job.heartbeat_at) or job.heartbeat_at < threshold)
+        if lease_expired or heartbeat_stale:
+            job.status = "queued"
+            job.worker_id = None
+            job.lease_expires_at = None
+            job.attempts += 1
+            count += 1
     return count
 
 
-def claim_next_job(db: Session) -> BackgroundJob | None:
-    job = db.scalar(select(BackgroundJob).where(BackgroundJob.status == "queued").order_by(BackgroundJob.id).limit(1))
-    if not job: return None
-    job.status = "running"; job.started_at = utcnow(); job.heartbeat_at = utcnow(); job.attempts += 1; db.flush(); return job
+def claim_next_job(db: Session, worker_id: str | None = None, lease_seconds: int = 900) -> BackgroundJob | None:
+    candidate_id = db.scalar(select(BackgroundJob.id).where(BackgroundJob.status == "queued").order_by(BackgroundJob.id).limit(1))
+    if candidate_id is None:
+        return None
+    now = utcnow()
+    worker_id = worker_id or "worker"
+    result = db.execute(
+        update(BackgroundJob)
+        .where(BackgroundJob.id == candidate_id, BackgroundJob.status == "queued")
+        .values(status="running", started_at=now, heartbeat_at=now, lease_expires_at=now + timedelta(seconds=lease_seconds), worker_id=worker_id, attempts=BackgroundJob.attempts + 1)
+    )
+    if result.rowcount != 1:
+        db.flush()
+        return None
+    db.flush()
+    return db.get(BackgroundJob, candidate_id)
+
+
+def _as_list(value) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, tuple):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return [x.strip() for x in str(value).replace(";", ",").split(",") if x.strip()]
+
+
+def _as_bool(value) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in {"true", "on", "1", "yes"}
+
+
+def build_search_preferences(crit: dict, profile_data: dict) -> dict:
+    search = crit.get("search", {}) if isinstance(crit, dict) else {}
+    onboarding = profile_data.get("onboarding", {}) if isinstance(profile_data, dict) else {}
+    salary = dict(search.get("salary") or {})
+    if not salary.get("minimum") and onboarding.get("salary_minimum"):
+        salary["minimum"] = int(onboarding.get("salary_minimum") or 0) or None
+    if not salary.get("currency"):
+        salary["currency"] = onboarding.get("currency", "RUB")
+    if salary.get("gross") is None and _as_bool(onboarding.get("gross")) is not None:
+        salary["gross"] = _as_bool(onboarding.get("gross"))
+    work_formats = _as_list(search.get("work_formats")) or _as_list(onboarding.get("work_formats")) or _as_list(onboarding.get("work_format"))
+    remote = bool(search.get("remote") or onboarding.get("remote") or "remote" in work_formats)
+    return {
+        "locations": _as_list(search.get("locations")) or _as_list(onboarding.get("cities")),
+        "all_russia": bool(search.get("all_russia") or onboarding.get("all_russia")),
+        "remote": remote,
+        "work_formats": work_formats,
+        "employment_types": _as_list(search.get("employment_types")) or _as_list(onboarding.get("employment_types")),
+        "salary": salary,
+        "seniority": _as_list(search.get("seniority")) or _as_list(onboarding.get("seniority")),
+    }
 
 
 def generate_criteria_from_profile(profile: dict, onboarding: dict) -> dict:
-    titles = onboarding.get("desired_titles") or [profile.get("professional_title", "")]
-    terms = [x for x in titles + onboarding.get("directions", []) + profile.get("skills", []) + onboarding.get("must_have", []) if x]
+    titles = _as_list(onboarding.get("desired_titles")) or [profile.get("professional_title", "")]
+    terms = [x for x in titles + _as_list(onboarding.get("directions")) + _as_list(profile.get("skills")) + _as_list(onboarding.get("must_have")) if x]
+    gross = _as_bool(onboarding.get("gross"))
     crit = json.loads(json.dumps(criteria.DEFAULT_CRITERIA, ensure_ascii=False))
     crit["profile_summary"] = profile.get("professional_title", "")
-    crit["search"].update({"desired_titles": titles, "adjacent_titles": onboarding.get("adjacent_roles", []), "directions": onboarding.get("directions", []), "queries": titles[:5], "locations": onboarding.get("cities", []), "work_formats": [onboarding.get("work_format", "any")], "employment_types": onboarding.get("employment_types", []), "seniority": [onboarding.get("seniority", "any")], "salary": {"minimum": int(onboarding.get("salary_minimum") or 0) or None, "currency": onboarding.get("currency", "RUB"), "gross": onboarding.get("gross")}})
-    crit["scoring"]["positive_rules"] = [{"name":"target role/domain terms","weight":12,"any_terms":terms[:20]}, {"name":"must-have conditions","weight":5,"any_terms":onboarding.get("must_have", [])}, {"name":"seniority/work format","weight":5,"any_terms":[onboarding.get("seniority",""), onboarding.get("work_format","")]}]
-    crit["scoring"]["red_flag_rules"] = [{"name":"stop factors","penalty":8,"cap":8,"terms":onboarding.get("stop_factors", []) + onboarding.get("undesired_duties", [])}]
+    crit["search"].update({
+        "desired_titles": titles,
+        "adjacent_titles": _as_list(onboarding.get("adjacent_roles")),
+        "directions": _as_list(onboarding.get("directions")),
+        "queries": titles[:5],
+        "locations": _as_list(onboarding.get("cities")),
+        "work_formats": _as_list(onboarding.get("work_format")) or ["any"],
+        "employment_types": _as_list(onboarding.get("employment_types")),
+        "seniority": _as_list(onboarding.get("seniority")) or ["any"],
+        "salary": {"minimum": int(onboarding.get("salary_minimum") or 0) or None, "currency": onboarding.get("currency", "RUB"), "gross": gross},
+    })
+    crit["scoring"]["positive_rules"] = [
+        {"name":"target role/domain terms","weight":12,"any_terms":terms[:20]},
+        {"name":"must-have conditions","weight":5,"any_terms":_as_list(onboarding.get("must_have"))},
+        {"name":"seniority/work format","weight":5,"any_terms":_as_list(onboarding.get("seniority")) + _as_list(onboarding.get("work_format"))},
+    ]
+    crit["scoring"]["red_flag_rules"] = [{"name":"stop factors","penalty":8,"cap":8,"terms":_as_list(onboarding.get("stop_factors")) + _as_list(onboarding.get("undesired_duties"))}]
     return criteria.validate_criteria(crit)
 
 
@@ -173,46 +246,98 @@ def handle_criteria_generation(db: Session, job: BackgroundJob, settings: Settin
     db.add(CriteriaVersion(user_id=job.user_id, profile_version_id=profile.id, version=(latest.version if latest else 0)+1, data_json=dumps(crit)))
 
 
+def _apply_vacancy_fields(v: Vacancy, item: dict, norm_title: str, norm_company: str, norm_loc: str, content_hash: str) -> None:
+    v.normalized_title = norm_title
+    v.normalized_company = norm_company
+    v.normalized_location = norm_loc
+    v.canonical_url = item.get("canonical_url") or v.canonical_url
+    v.content_hash = content_hash
+    v.title = item.get("title", "")
+    v.company = item.get("company", "")
+    v.location = item.get("location", "")
+    v.description = item.get("description", "")
+    v.work_format = item.get("work_format") or ""
+    v.employment_type = item.get("employment_type") or ""
+    v.salary_json = dumps(item.get("salary")) if item.get("salary") is not None else "{}"
+    v.published_at = item.get("published_at") or ""
+    v.updated_at = item.get("updated_at") or ""
+    v.requirements = item.get("requirements") or ""
+    v.responsibilities = item.get("responsibilities") or ""
+    v.conditions = item.get("conditions") or ""
+    v.skills_json = dumps(item.get("skills") or [])
+    v.normalized_json = dumps(item)
+
+
 def _upsert_vacancy(db: Session, item: dict) -> Vacancy:
-    norm_title = normalize_title(item.get("title", "")); norm_company = (item.get("company") or "").lower().strip(); norm_loc = (item.get("location") or "").lower().strip()
+    norm_title = normalize_title(item.get("title", ""))
+    norm_company = (item.get("company") or "").lower().strip()
+    norm_loc = (item.get("location") or "").lower().strip()
     content_hash = item.get("content_hash") or hashlib.sha256((item.get("description") or "").encode()).hexdigest()
     existing = None
-    if item.get("canonical_url"):
+    if item.get("source") and item.get("external_id"):
+        source_row = db.scalar(select(VacancySource).where(VacancySource.source == item["source"], VacancySource.external_id == item["external_id"]))
+        if source_row:
+            existing = db.get(Vacancy, source_row.vacancy_id)
+    if not existing and item.get("canonical_url"):
         existing = db.scalar(select(Vacancy).where(Vacancy.canonical_url == item["canonical_url"]))
     if not existing and content_hash:
         existing = db.scalar(select(Vacancy).where(Vacancy.content_hash == content_hash, Vacancy.normalized_title == norm_title, Vacancy.normalized_company == norm_company))
     if not existing:
         existing = db.scalar(select(Vacancy).where(Vacancy.normalized_title == norm_title, Vacancy.normalized_company == norm_company, Vacancy.normalized_location == norm_loc, Vacancy.content_hash == content_hash))
     if existing:
+        _apply_vacancy_fields(existing, item, norm_title, norm_company, norm_loc, content_hash)
+        db.flush()
         return existing
-    v = Vacancy(
-        normalized_title=norm_title, normalized_company=norm_company, normalized_location=norm_loc,
-        canonical_url=item.get("canonical_url"), content_hash=content_hash, title=item.get("title",""),
-        company=item.get("company",""), location=item.get("location",""), description=item.get("description", ""),
-        work_format=item.get("work_format") or "", employment_type=item.get("employment_type") or "",
-        salary_json=dumps(item.get("salary") or {}), published_at=item.get("published_at") or "", updated_at=item.get("updated_at") or "",
-        requirements=item.get("requirements") or "", responsibilities=item.get("responsibilities") or "", conditions=item.get("conditions") or "",
-        skills_json=dumps(item.get("skills") or []), normalized_json=dumps(item),
-    )
-    db.add(v); db.flush(); return v
+    v = Vacancy(normalized_title=norm_title, normalized_company=norm_company, normalized_location=norm_loc, title=item.get("title", ""))
+    _apply_vacancy_fields(v, item, norm_title, norm_company, norm_loc, content_hash)
+    db.add(v)
+    db.flush()
+    return v
+
+
+def _upsert_source_snapshot(db: Session, vacancy: Vacancy, item: dict) -> VacancySource:
+    source = item["source"]
+    external_id = item["external_id"]
+    row = db.scalar(select(VacancySource).where(VacancySource.source == source, VacancySource.external_id == external_id))
+    if not row:
+        row = VacancySource(vacancy_id=vacancy.id, source=source, external_id=external_id, source_url=item.get("source_url") or item.get("canonical_url") or "", raw_json=dumps(item))
+        db.add(row)
+    else:
+        row.vacancy_id = vacancy.id
+        row.source_url = item.get("source_url") or item.get("canonical_url") or row.source_url
+        row.raw_json = dumps(item)
+        row.fetched_at = utcnow()
+    db.flush()
+    return row
 
 
 def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings, runner, adapter_factory=None) -> None:
     settings = settings_from_db(db, settings)
     profile = db.scalar(select(ProfileVersion).where(ProfileVersion.user_id == job.user_id, ProfileVersion.confirmed == True).order_by(ProfileVersion.version.desc()))
     crit_v = db.scalar(select(CriteriaVersion).where(CriteriaVersion.user_id == job.user_id).order_by(CriteriaVersion.version.desc()))
-    if not profile or not crit_v: raise RuntimeError("profile and criteria required")
-    crit = loads(crit_v.data_json); profile_data = loads(profile.data_json)
-    run = SearchRun(user_id=job.user_id, job_id=job.id, status="running"); db.add(run); db.flush()
+    if not profile or not crit_v:
+        raise RuntimeError("profile and criteria required")
+    crit = loads(crit_v.data_json)
+    profile_data = loads(profile.data_json)
+    preferences = build_search_preferences(crit, profile_data)
+    run = SearchRun(user_id=job.user_id, job_id=job.id, status="running")
+    db.add(run)
+    db.flush()
+    audit(db, "search_started", job.user_id, job.user_id, run_id=run.id)
     queries = crit["search"].get("queries") or crit["search"].get("desired_titles") or [profile_data.get("professional_title", "")]
     schedule = db.scalar(select(UserSchedule).where(UserSchedule.user_id == job.user_id))
     requested_sources = loads(schedule.sources_json, list(settings.enabled_sources)) if schedule else list(settings.enabled_sources)
     selected_sources = [source for source in requested_sources if source in settings.enabled_sources and source in ADAPTERS]
-    errors=[]; scores=[]
+    errors=[]
+    scores=[]
+    attempted_sources = 0
+    successful_sources = 0
     total_seen = 0
     for source in selected_sources:
         if total_seen >= settings.max_vacancies_per_run:
             break
+        attempted_sources += 1
+        adapter = None
         try:
             Adapter = ADAPTERS[source]
             adapter = adapter_factory(source) if adapter_factory else Adapter(settings)
@@ -220,64 +345,99 @@ def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings,
             for query in queries[:settings.max_search_queries]:
                 if source_seen >= settings.max_results_per_source or total_seen >= settings.max_vacancies_per_run:
                     break
-                for result in adapter.search(query, loads(schedule.preferences_json, {}) if schedule else {}):
+                touch_job(db, job, progress=min(55, 5 + total_seen))
+                for result in adapter.search(query, preferences):
                     if source_seen >= settings.max_results_per_source or total_seen >= settings.max_vacancies_per_run:
                         break
+                    touch_job(db, job, progress=min(60, 10 + total_seen))
                     full = adapter.fetch_details(result)
                     item = adapter.normalize(full)
                     vacancy = _upsert_vacancy(db, item)
-                    src = db.scalar(select(VacancySource).where(VacancySource.source == source, VacancySource.external_id == item["external_id"]))
-                    if not src:
-                        db.add(VacancySource(vacancy_id=vacancy.id, source=source, external_id=item["external_id"], source_url=item["source_url"], raw_json=dumps(item)))
+                    _upsert_source_snapshot(db, vacancy, item)
                     if db.scalar(select(RunVacancy).where(RunVacancy.run_id == run.id, RunVacancy.vacancy_id == vacancy.id)):
                         continue
                     db.add(RunVacancy(run_id=run.id, vacancy_id=vacancy.id, has_full_description=bool(vacancy.description)))
                     pre = scoring.deterministic_prescore({**item, "id": vacancy.id}, crit)
                     score = VacancyScore(user_id=job.user_id, run_id=run.id, vacancy_id=vacancy.id, profile_version_id=profile.id, criteria_version_id=crit_v.id, prescore=pre["score"], final_score=pre["score"], decision=pre["decision"], signals_json=dumps(pre), recommendations_json=dumps({"why_fits":"Deterministic criteria match","resume_angle":pre["positive_signals"],"risks":pre["red_flags"]}))
-                    db.add(score); db.flush(); scores.append({"user_id":job.user_id,"run_id":run.id,"vacancy_id":vacancy.id,"prescore":pre["score"],"has_full_description":bool(vacancy.description)})
-                    source_seen += 1; total_seen += 1
+                    db.add(score)
+                    db.flush()
+                    scores.append({"user_id":job.user_id,"run_id":run.id,"vacancy_id":vacancy.id,"prescore":pre["score"],"has_full_description":bool(vacancy.description)})
+                    source_seen += 1
+                    total_seen += 1
+            successful_sources += 1
             health = db.scalar(select(SourceHealth).where(SourceHealth.source == source)) or SourceHealth(source=source, status="ok")
             health.status="ok"; health.last_error=None; health.checked_at=utcnow(); db.add(health)
         except Exception as exc:
             errors.append({"source":source,"error":str(exc)})
+            audit(db, "source_error", job.user_id, job.user_id, run_id=run.id, source=source, error=str(exc)[:500])
             health = db.scalar(select(SourceHealth).where(SourceHealth.source == source)) or SourceHealth(source=source, status="error")
-            health.status="error"; health.last_error=str(exc); db.add(health)
-    avg = scoring.run_average(scores, user_id=job.user_id, run_id=run.id); run.average_prescore = avg
+            health.status="error"; health.last_error=str(exc); health.checked_at=utcnow(); db.add(health)
+        finally:
+            if adapter is not None and hasattr(adapter, "close"):
+                adapter.close()
+    avg = scoring.run_average(scores, user_id=job.user_id, run_id=run.id)
+    run.average_prescore = avg
     candidates = scoring.codex_candidates(scores, user_id=job.user_id, run_id=run.id)[:settings.max_llm_candidates]
-    outputs=[]; llm_inputs=[]
+    outputs=[]
+    llm_inputs=[]
     run_dir = settings.run_dir / str(run.id)
     run_dir.mkdir(parents=True, exist_ok=True)
     batch_size = max(1, settings.codex_batch_size)
     for start in range(0, len(candidates), batch_size):
+        touch_job(db, job, progress=min(95, 60 + int(35 * start / max(1, len(candidates)))))
         for vacancy_id in candidates[start:start + batch_size]:
             score = db.scalar(select(VacancyScore).where(VacancyScore.user_id == job.user_id, VacancyScore.run_id == run.id, VacancyScore.vacancy_id == vacancy_id))
-            vacancy = db.get(Vacancy, vacancy_id); pre = loads(score.signals_json)
+            vacancy = db.get(Vacancy, vacancy_id)
+            pre = loads(score.signals_json)
             vacancy_payload = {"id": str(vacancy.id), "title": vacancy.title, "company": vacancy.company, "location": vacancy.location, "description": vacancy.description, "work_format": vacancy.work_format, "employment_type": vacancy.employment_type, "salary": loads(vacancy.salary_json), "requirements": vacancy.requirements, "responsibilities": vacancy.responsibilities, "conditions": vacancy.conditions, "skills": loads(vacancy.skills_json, [])}
             input_record = {"user_id": job.user_id, "run_id": run.id, "vacancy_id": vacancy.id, "profile_version_id": profile.id, "criteria_version_id": crit_v.id, "profile": profile_data, "criteria": crit, "vacancy": vacancy_payload, "deterministic_signals": pre}
             llm_inputs.append(input_record)
             prompt = codex_integration.build_vacancy_evaluation_prompt(profile_data, crit, vacancy_payload, pre)
             try:
-                job.status="codex_scoring"; job.progress=min(95, 60 + int(35 * (len(outputs)+1) / max(1, len(candidates)))); db.flush()
+                job.status="codex_scoring"
+                job.progress=min(95, 60 + int(35 * (len(outputs)+1) / max(1, len(candidates))))
+                touch_job(db, job, progress=job.progress)
                 result = runner.run("vacancy_evaluation", prompt, lambda data, vid=str(vacancy.id): codex_integration.validate_codex_result(data, vid, crit), run_dir)
-                score.final_score = result["score"]; score.decision = result["decision"]; score.recommendations_json = dumps(result); outputs.append(result)
+                score.final_score = result["score"]
+                score.decision = result["decision"]
+                score.recommendations_json = dumps(result)
+                outputs.append(result)
             except Exception as exc:
                 errors.append({"vacancy_id":vacancy_id,"error":str(exc)})
-    run.status="completed"; run.finished_at=utcnow(); run.summary_json=dumps({"errors":errors,"candidates":candidates,"average_prescore":avg})
-    codex_integration.write_run_artifacts(run_dir, llm_inputs, outputs, errors, {"status":"completed","average_prescore":avg,"llm_candidates":len(candidates)})
+                audit(db, "codex_error", job.user_id, job.user_id, run_id=run.id, vacancy_id=vacancy_id, error=str(exc)[:500])
+    if attempted_sources == 0 or successful_sources == 0:
+        status = "failed"
+    elif errors:
+        status = "partial"
+    else:
+        status = "completed"
+    run.status=status
+    run.finished_at=utcnow()
+    summary = {"errors":errors,"candidates":candidates,"average_prescore":avg,"attempted_sources":attempted_sources,"successful_sources":successful_sources}
+    run.summary_json=dumps(summary)
+    codex_integration.write_run_artifacts(run_dir, llm_inputs, outputs, errors, {"status":status,"average_prescore":avg,"llm_candidates":len(candidates)})
+    audit(db, "search_finished", job.user_id, job.user_id, run_id=run.id, status=status, errors=len(errors))
     if schedule:
         schedule.last_run_at=utcnow()
 
 
 def handle_cover_letter(db: Session, job: BackgroundJob, settings: Settings, runner) -> None:
-    payload=loads(job.payload_json); vacancy=db.get(Vacancy, payload["vacancy_id"]); score=db.scalar(select(VacancyScore).where(VacancyScore.user_id==job.user_id, VacancyScore.vacancy_id==vacancy.id).order_by(VacancyScore.id.desc()))
+    settings = settings_from_db(db, settings)
+    payload=loads(job.payload_json)
+    vacancy=db.get(Vacancy, payload["vacancy_id"])
+    score=db.scalar(select(VacancyScore).where(VacancyScore.user_id==job.user_id, VacancyScore.vacancy_id==vacancy.id).order_by(VacancyScore.id.desc()))
     profile=db.scalar(select(ProfileVersion).where(ProfileVersion.user_id==job.user_id, ProfileVersion.confirmed==True).order_by(ProfileVersion.version.desc()))
+    crit_v=db.scalar(select(CriteriaVersion).where(CriteriaVersion.user_id==job.user_id).order_by(CriteriaVersion.version.desc()))
+    crit=loads(crit_v.data_json) if crit_v else criteria.DEFAULT_CRITERIA
+    max_chars=int((crit.get("output") or {}).get("cover_letter_max_chars") or 300)
     prompt=codex_integration.build_cover_letter_prompt(loads(profile.data_json), {"title":vacancy.title,"company":vacancy.company,"description":vacancy.description}, loads(score.recommendations_json))
     run_dir = settings.run_dir / f"job-{job.id}"
+    validator = lambda data: codex_integration.validate_cover_letter_result(data, max_chars=max_chars)
     try:
-        result=runner.run("cover_letter", prompt, codex_integration.validate_cover_letter_result, run_dir)
+        result=runner.run("cover_letter", prompt, validator, run_dir)
     except codex_integration.CoverLetterTooLong as exc:
-        shorten_prompt = codex_integration.build_cover_letter_shortening_prompt(exc.text, exc.max_chars)
-        result=runner.run("cover_letter_shorten", shorten_prompt, codex_integration.validate_cover_letter_result, run_dir)
+        shorten_prompt = codex_integration.build_cover_letter_shortening_prompt(exc.text, max_chars)
+        result=runner.run("cover_letter_shorten", shorten_prompt, validator, run_dir)
     latest=db.scalar(select(CoverLetter).where(CoverLetter.user_id==job.user_id, CoverLetter.vacancy_id==vacancy.id).order_by(CoverLetter.version.desc()))
     db.add(CoverLetter(user_id=job.user_id, vacancy_id=vacancy.id, version=(latest.version if latest else 0)+1, text=result["text"]))
 
@@ -285,21 +445,36 @@ HANDLERS = {"resume_profile_extraction": handle_profile_extraction, "criteria_ge
 
 
 def process_one(SessionLocal, settings: Settings, runner=None, adapter_factory=None) -> bool:
-    runner = runner or CodexRunner(settings)
     with SessionLocal() as db:
-        recover_stale_jobs(db); job = claim_next_job(db)
-        if not job: db.commit(); return False
+        recover_stale_jobs(db)
+        job = claim_next_job(db, worker_id="worker")
+        if not job:
+            db.commit()
+            return False
         db.commit()
     with SessionLocal() as db:
+        effective = settings_from_db(db, settings)
+        active_runner = runner or CodexRunner(effective)
+        cleanup_old_run_artifacts(effective)
         job = db.get(BackgroundJob, job.id)
         try:
-            job.heartbeat_at = utcnow(); job.status = "running"; db.flush()
-            if job.type == "scheduled_search": handle_scheduled_search(db, job, settings, runner, adapter_factory)
-            elif job.type in HANDLERS: HANDLERS[job.type](db, job, settings, runner)
-            else: raise RuntimeError(f"unknown job type {job.type}")
-            job.status="completed"; job.progress=100; job.technical_error=None; job.finished_at=utcnow(); job.active_key=None; db.commit(); return True
+            job.status = "running"
+            touch_job(db, job, progress=job.progress)
+            if job.type == "scheduled_search":
+                handle_scheduled_search(db, job, effective, active_runner, adapter_factory)
+            elif job.type in HANDLERS:
+                HANDLERS[job.type](db, job, effective, active_runner)
+            else:
+                raise RuntimeError(f"unknown job type {job.type}")
+            job.status="completed"; job.progress=100; job.technical_error=None; job.finished_at=utcnow(); job.active_key=None; job.worker_id=None; job.lease_expires_at=None; db.commit(); return True
         except Exception as exc:
-            job.technical_error = str(exc)[:1000]; job.status = "queued" if job.attempts < job.max_attempts else "failed"; job.finished_at = utcnow() if job.status == "failed" else None; job.active_key=None if job.status in {"failed","completed"} else job.active_key; db.commit(); return True
+            job.technical_error = str(exc)[:1000]
+            job.status = "queued" if job.attempts < job.max_attempts else "failed"
+            job.finished_at = utcnow() if job.status == "failed" else None
+            job.active_key=None if job.status in {"failed","completed"} else job.active_key
+            job.worker_id=None; job.lease_expires_at=None
+            audit(db, "job_error", job.user_id, job.user_id, job_id=job.id, error=str(exc)[:500])
+            db.commit(); return True
 
 
 def schedule_due_jobs(SessionLocal, settings: Settings, *, now: datetime | None = None) -> int:
@@ -323,6 +498,8 @@ def schedule_due_jobs(SessionLocal, settings: Settings, *, now: datetime | None 
 def main() -> None:
     settings = load_settings(); settings.ensure_dirs(); SessionLocal = session_factory(settings)
     while True:
+        with SessionLocal() as db:
+            cleanup_old_run_artifacts(settings_from_db(db, settings))
         schedule_due_jobs(SessionLocal, settings)
         process_one(SessionLocal, settings)
         time.sleep(5)

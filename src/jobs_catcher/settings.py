@@ -17,6 +17,7 @@ class Settings:
     environment: str = "development"
     min_schedule_interval_days: int = 1
     max_schedule_interval_days: int = 30
+    timezone: str = "Europe/Moscow"
     enabled_sources: tuple[str, ...] = ("hh", "habr", "superjob", "rabota", "geekjob", "getmatch")
     http_delay_seconds: float = 1.0
     http_jitter_seconds: float = 0.5
@@ -75,6 +76,7 @@ def load_settings() -> Settings:
         environment=os.getenv("ENVIRONMENT", "development"),
         min_schedule_interval_days=_int_env("MIN_SCHEDULE_INTERVAL_DAYS", 1),
         max_schedule_interval_days=_int_env("MAX_SCHEDULE_INTERVAL_DAYS", 30),
+        timezone=os.getenv("TIMEZONE", "Europe/Moscow"),
         enabled_sources=_tuple_env("ENABLED_SOURCES", ("hh", "habr", "superjob", "rabota", "geekjob", "getmatch")),
         http_delay_seconds=_float_env("HTTP_DELAY_SECONDS", 1.0),
         http_jitter_seconds=_float_env("HTTP_JITTER_SECONDS", 0.5),

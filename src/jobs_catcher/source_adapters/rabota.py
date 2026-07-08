@@ -8,6 +8,15 @@ class RabotaAdapter(SourceAdapter):
     path = "/vacancy/"
     query_param = "query"
     search_link_patterns = (r'<a[^>]+href=["\']([^"\']*/rabota/vacancy/[^"\']+)["\'][^>]*>(.*?)</a>',)
-    defaults = {**SourceAdapter.defaults, "work_format":"office", "skills":["requirements", "api"]}
     def build_search_url(self, query, preferences, page=0):
-        return f"{self.base_url}{self.path}?{urlencode({'query': query, 'page': page + 1})}"
+        params = {"query": query, "page": page + 1}
+        if preferences.get("locations") and not preferences.get("all_russia"):
+            params["region"] = ",".join(preferences["locations"])
+        if preferences.get("remote") or "remote" in preferences.get("work_formats", []):
+            params["schedule"] = "remote"
+        if preferences.get("employment_types"):
+            params["employment"] = ",".join(preferences["employment_types"])
+        salary = preferences.get("salary") or {}
+        if salary.get("minimum"):
+            params["salary"] = str(salary["minimum"])
+        return f"{self.base_url}{self.path}?{urlencode(params)}"

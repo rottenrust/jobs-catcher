@@ -1,0 +1,1 @@
+{% extends "base.html" %}{% block body %}<h1>Runs</h1><table><thead><tr><th>ID</th><th>User</th><th>Status</th><th>Average</th><th>Summary</th></tr></thead><tbody>{% for r in rows %}<tr><td>{{ r.id }}</td><td>{{ r.user_id }}</td><td>{{ r.status }}</td><td>{{ r.average_prescore }}</td><td>{{ r.summary }}</td></tr>{% endfor %}</tbody></table>{% endblock %}
