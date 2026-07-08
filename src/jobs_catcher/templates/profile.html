@@ -1,0 +1,1 @@
+{% extends "base.html" %}{% block body %}<h1>Profile</h1><form method="post" action="/profile/confirm"><input type="hidden" name="csrf" value="{{ csrf }}"><pre>{{ profile }}</pre><button>Confirm</button></form>{% endblock %}

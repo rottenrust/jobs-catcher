@@ -10,7 +10,7 @@ from sqlalchemy import select
 from jobs_catcher.settings import Settings
 from jobs_catcher.web import create_app
 from jobs_catcher.db import make_engine
-from jobs_catcher.models import BackgroundJob, CoverLetter, CriteriaVersion, ResumeFile, UserSession, VacancyScore, VacancyUIState
+from jobs_catcher.models import BackgroundJob, CoverLetter, CriteriaVersion, ResumeFile, UserSchedule, UserSession, VacancyScore, VacancyUIState
 from jobs_catcher.worker import DeterministicMockCodexRunner, process_one, schedule_due_jobs, session_factory
 from jobs_catcher.source_adapters.base import VacancyResult
 from jobs_catcher import scoring
@@ -94,7 +94,10 @@ def test_fixture_e2e_persistence_worker_restart_non_ai_criteria(tmp_path):
     bad=scoring.deterministic_prescore({'title':'LLM Engineer','description':'RAG agents API'}, crit)
     assert good['score'] > bad['score']
     assert user.post('/schedule', data={'interval_days':'1','sources':'hh,habr,superjob,rabota,geekjob,getmatch'}, headers={'x-csrf-token':ucsrf}).status_code == 200
-    assert schedule_due_jobs(SessionLocal, st) == 1
+    with SessionLocal() as db:
+        due_at = db.scalar(select(UserSchedule.next_run_at).where(UserSchedule.user_id == uid))
+    assert schedule_due_jobs(SessionLocal, st) == 0
+    assert schedule_due_jobs(SessionLocal, st, now=due_at) == 1
     # Simulate worker restart: new SessionLocal and same DB still see queued job.
     SessionLocal2=session_factory(st)
     with SessionLocal2() as db:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib, json, time
+from dataclasses import replace
+from datetime import datetime, time as dt_time, timezone, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -12,6 +15,7 @@ from .dedup import normalize_title
 from .models import (
     BackgroundJob, CoverLetter, CriteriaVersion, ProfileVersion, ResumeFile, SearchRun,
     SourceHealth, UserSchedule, Vacancy, VacancyScore, VacancySource, RunVacancy,
+    AppSetting,
 )
 from .settings import Settings, load_settings
 from .source_adapters import ADAPTERS
@@ -24,6 +28,55 @@ def loads(text: str | None, default=None):
     if not text:
         return {} if default is None else default
     return json.loads(text)
+
+SETTINGS_KEYS = {
+    "enabled_sources", "min_schedule_interval_days", "max_schedule_interval_days",
+    "http_delay_seconds", "http_jitter_seconds", "http_timeout_seconds",
+    "http_retries", "max_search_queries", "max_results_per_source",
+    "max_vacancies_per_run", "max_llm_candidates", "codex_batch_size",
+    "resume_size_limit", "artifact_retention_days", "global_search_enabled",
+}
+
+def settings_from_db(db: Session, base: Settings) -> Settings:
+    values = {}
+    for row in db.scalars(select(AppSetting)).all():
+        if row.key not in SETTINGS_KEYS:
+            continue
+        value = loads(row.value_json)
+        if row.key == "enabled_sources":
+            value = tuple(x for x in value if x in ADAPTERS)
+        values[row.key] = value
+    return replace(base, **values) if values else base
+
+def validate_run_time(value: str) -> tuple[int, int]:
+    try:
+        hour_s, minute_s = value.split(":", 1)
+        hour, minute = int(hour_s), int(minute_s)
+    except Exception as exc:
+        raise ValueError("run_time must be HH:MM") from exc
+    if hour not in range(24) or minute not in range(60):
+        raise ValueError("run_time must be HH:MM")
+    return hour, minute
+
+def validate_timezone(value: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(value)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError("timezone must be an IANA timezone") from exc
+
+def compute_next_run_at(interval_days: int, run_time: str, timezone_name: str, *, now: datetime | None = None) -> datetime:
+    if interval_days < 1:
+        raise ValueError("minimum schedule interval is one day")
+    hour, minute = validate_run_time(run_time)
+    tz = validate_timezone(timezone_name)
+    now_utc = now or utcnow()
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    now_local = now_utc.astimezone(tz)
+    target_local = datetime.combine(now_local.date(), dt_time(hour, minute), tzinfo=tz)
+    if now_local >= target_local:
+        target_local = target_local + timedelta(days=interval_days)
+    return target_local.astimezone(timezone.utc)
 
 class CodexRunner:
     def __init__(self, settings: Settings, subprocess_run=codex_integration.default_subprocess_run):
@@ -49,13 +102,16 @@ class DeterministicMockCodexRunner:
             deterministic = json.loads(prompt.split("DETERMINISTIC=",1)[1])
             result = {"vacancy_id":str(vacancy["id"]),"score":deterministic["score"],"decision":deterministic["decision"],"confidence":"high","role_summary":vacancy.get("title",""),"matching_signals":deterministic.get("positive_signals",[]),"missing_signals":deterministic.get("missing_signals",[]),"red_flags":deterministic.get("red_flags",[]),"applied_caps":deterministic.get("caps",[]),"why_fits":"Matches configured criteria","why_not_or_risks":"","what_to_check_before_apply":["details"],"resume_angle":["confirmed facts"],"cover_letter_points":["value"],"prescore_comment":"criteria-driven"}
             return validator(result)
-        if scenario == "cover_letter":
+        if scenario in {"cover_letter", "cover_letter_shorten"}:
             return validator({"text":"Здравствуйте! Заинтересовала вакансия: мой подтвержденный опыт поможет быстро принести практическую пользу команде."})
         raise RuntimeError(scenario)
 
 
 def session_factory(settings: Settings):
-    engine = make_engine(settings.database_url); create_schema(engine); SessionLocal = make_session_factory(engine)
+    engine = make_engine(settings.database_url)
+    if not settings.production:
+        create_schema(engine)
+    SessionLocal = make_session_factory(engine)
     with SessionLocal() as db: bootstrap_admin(db)
     return SessionLocal
 
@@ -133,6 +189,7 @@ def _upsert_vacancy(db: Session, item: dict) -> Vacancy:
 
 
 def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings, runner, adapter_factory=None) -> None:
+    settings = settings_from_db(db, settings)
     profile = db.scalar(select(ProfileVersion).where(ProfileVersion.user_id == job.user_id, ProfileVersion.confirmed == True).order_by(ProfileVersion.version.desc()))
     crit_v = db.scalar(select(CriteriaVersion).where(CriteriaVersion.user_id == job.user_id).order_by(CriteriaVersion.version.desc()))
     if not profile or not crit_v: raise RuntimeError("profile and criteria required")
@@ -140,14 +197,23 @@ def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings,
     run = SearchRun(user_id=job.user_id, job_id=job.id, status="running"); db.add(run); db.flush()
     queries = crit["search"].get("queries") or crit["search"].get("desired_titles") or [profile_data.get("professional_title", "")]
     schedule = db.scalar(select(UserSchedule).where(UserSchedule.user_id == job.user_id))
-    selected_sources = loads(schedule.sources_json, list(settings.enabled_sources)) if schedule else list(settings.enabled_sources)
+    requested_sources = loads(schedule.sources_json, list(settings.enabled_sources)) if schedule else list(settings.enabled_sources)
+    selected_sources = [source for source in requested_sources if source in settings.enabled_sources and source in ADAPTERS]
     errors=[]; scores=[]
-    for source in selected_sources[:len(settings.enabled_sources)]:
+    total_seen = 0
+    for source in selected_sources:
+        if total_seen >= settings.max_vacancies_per_run:
+            break
         try:
             Adapter = ADAPTERS[source]
             adapter = adapter_factory(source) if adapter_factory else Adapter(settings)
+            source_seen = 0
             for query in queries[:settings.max_search_queries]:
+                if source_seen >= settings.max_results_per_source or total_seen >= settings.max_vacancies_per_run:
+                    break
                 for result in adapter.search(query, loads(schedule.preferences_json, {}) if schedule else {}):
+                    if source_seen >= settings.max_results_per_source or total_seen >= settings.max_vacancies_per_run:
+                        break
                     full = adapter.fetch_details(result)
                     item = adapter.normalize(full)
                     vacancy = _upsert_vacancy(db, item)
@@ -160,12 +226,15 @@ def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings,
                     pre = scoring.deterministic_prescore({**item, "id": vacancy.id}, crit)
                     score = VacancyScore(user_id=job.user_id, run_id=run.id, vacancy_id=vacancy.id, profile_version_id=profile.id, criteria_version_id=crit_v.id, prescore=pre["score"], final_score=pre["score"], decision=pre["decision"], signals_json=dumps(pre), recommendations_json=dumps({"why_fits":"Deterministic criteria match","resume_angle":pre["positive_signals"],"risks":pre["red_flags"]}))
                     db.add(score); db.flush(); scores.append({"user_id":job.user_id,"run_id":run.id,"vacancy_id":vacancy.id,"prescore":pre["score"],"has_full_description":bool(vacancy.description)})
+                    source_seen += 1; total_seen += 1
+            health = db.scalar(select(SourceHealth).where(SourceHealth.source == source)) or SourceHealth(source=source, status="ok")
+            health.status="ok"; health.last_error=None; health.checked_at=utcnow(); db.add(health)
         except Exception as exc:
             errors.append({"source":source,"error":str(exc)})
             health = db.scalar(select(SourceHealth).where(SourceHealth.source == source)) or SourceHealth(source=source, status="error")
             health.status="error"; health.last_error=str(exc); db.add(health)
     avg = scoring.run_average(scores, user_id=job.user_id, run_id=run.id); run.average_prescore = avg
-    candidates = scoring.codex_candidates(scores, user_id=job.user_id, run_id=run.id)[:settings.max_llm_candidates]
+    candidates = scoring.codex_candidates(scores, user_id=job.user_id, run_id=run.id)[:min(settings.max_llm_candidates, settings.codex_batch_size)]
     outputs=[]
     for vacancy_id in candidates:
         score = db.scalar(select(VacancyScore).where(VacancyScore.user_id == job.user_id, VacancyScore.run_id == run.id, VacancyScore.vacancy_id == vacancy_id))
@@ -178,14 +247,22 @@ def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings,
             errors.append({"vacancy_id":vacancy_id,"error":str(exc)})
     run.status="completed"; run.finished_at=utcnow(); run.summary_json=dumps({"errors":errors,"candidates":candidates,"average_prescore":avg})
     codex_integration.write_run_artifacts(settings.run_dir / str(run.id), [{"vacancy_id":x["vacancy_id"],"prescore":x["prescore"]} for x in scores if x["vacancy_id"] in candidates], outputs, errors, {"status":"completed","average_prescore":avg,"llm_candidates":len(candidates)})
-    if schedule: schedule.last_run_at=utcnow(); schedule.next_run_at=utcnow().replace()  # tests assert no early duplicate via scheduler
+    if schedule:
+        schedule.last_run_at=utcnow()
 
 
 def handle_cover_letter(db: Session, job: BackgroundJob, settings: Settings, runner) -> None:
     payload=loads(job.payload_json); vacancy=db.get(Vacancy, payload["vacancy_id"]); score=db.scalar(select(VacancyScore).where(VacancyScore.user_id==job.user_id, VacancyScore.vacancy_id==vacancy.id).order_by(VacancyScore.id.desc()))
     profile=db.scalar(select(ProfileVersion).where(ProfileVersion.user_id==job.user_id, ProfileVersion.confirmed==True).order_by(ProfileVersion.version.desc()))
     prompt=codex_integration.build_cover_letter_prompt(loads(profile.data_json), {"title":vacancy.title,"company":vacancy.company,"description":vacancy.description}, loads(score.recommendations_json))
-    result=runner.run("cover_letter", prompt, codex_integration.validate_cover_letter_result, settings.run_dir / f"job-{job.id}")
+    run_dir = settings.run_dir / f"job-{job.id}"
+    try:
+        result=runner.run("cover_letter", prompt, codex_integration.validate_cover_letter_result, run_dir)
+    except ValueError as exc:
+        if "too long" not in str(exc):
+            raise
+        shorten_prompt = codex_integration.build_cover_letter_shortening_prompt(getattr(exc, "text", "") or prompt, 300)
+        result=runner.run("cover_letter_shorten", shorten_prompt, codex_integration.validate_cover_letter_result, run_dir)
     latest=db.scalar(select(CoverLetter).where(CoverLetter.user_id==job.user_id, CoverLetter.vacancy_id==vacancy.id).order_by(CoverLetter.version.desc()))
     db.add(CoverLetter(user_id=job.user_id, vacancy_id=vacancy.id, version=(latest.version if latest else 0)+1, text=result["text"]))
 
@@ -210,17 +287,20 @@ def process_one(SessionLocal, settings: Settings, runner=None, adapter_factory=N
             job.technical_error = str(exc)[:1000]; job.status = "queued" if job.attempts < job.max_attempts else "failed"; job.finished_at = utcnow() if job.status == "failed" else None; job.active_key=None if job.status in {"failed","completed"} else job.active_key; db.commit(); return True
 
 
-def schedule_due_jobs(SessionLocal, settings: Settings) -> int:
-    if not settings.global_search_enabled: return 0
+def schedule_due_jobs(SessionLocal, settings: Settings, *, now: datetime | None = None) -> int:
     count=0
+    now = now or utcnow()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     with SessionLocal() as db:
-        for sched in db.scalars(select(UserSchedule).where(UserSchedule.enabled == True, UserSchedule.next_run_at <= utcnow())).all():
+        settings = settings_from_db(db, settings)
+        if not settings.global_search_enabled:
+            return 0
+        for sched in db.scalars(select(UserSchedule).where(UserSchedule.enabled == True, UserSchedule.next_run_at <= now)).all():
             active_key=f"{sched.user_id}:scheduled_search"
             if not db.scalar(select(BackgroundJob).where(BackgroundJob.active_key==active_key, BackgroundJob.status.in_(queue.ACTIVE_STATUSES))):
                 enqueue_job(db, sched.user_id, "scheduled_search", {"schedule_id":sched.id}, active_key=active_key); count+=1
-                # minimum interval enforced here; next_run moves forward before worker completion to avoid duplicate enqueue.
-                from datetime import timedelta
-                sched.next_run_at = utcnow() + timedelta(days=max(settings.min_schedule_interval_days, sched.interval_days))
+                sched.next_run_at = compute_next_run_at(max(settings.min_schedule_interval_days, sched.interval_days), sched.run_time, sched.timezone, now=now)
         db.commit()
     return count
 

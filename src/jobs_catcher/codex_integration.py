@@ -32,6 +32,9 @@ def build_vacancy_evaluation_prompt(profile: dict, criteria: dict, vacancy: dict
 def build_cover_letter_prompt(profile: dict, vacancy: dict, recommendations: dict) -> str:
     return f"{_security_header()}\nЗадача: короткое сопроводительное письмо на русском до 300 символов, только подтвержденные факты. Верни {{\"text\": \"...\"}}.\nPROFILE={json.dumps(profile, ensure_ascii=False)}\nVACANCY={json.dumps(vacancy, ensure_ascii=False)}\nRECOMMENDATIONS={json.dumps(recommendations, ensure_ascii=False)}"
 
+def build_cover_letter_shortening_prompt(text: str, max_chars: int = 300) -> str:
+    return f"{_security_header()}\nЗадача: сократи письмо до {max_chars} символов без новых фактов. Верни {{\"text\": \"...\"}}.\nORIGINAL={json.dumps(text, ensure_ascii=False)}"
+
 
 def validate_profile_result(result: dict) -> dict:
     if not isinstance(result, dict):

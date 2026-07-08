@@ -56,30 +56,58 @@ class SourceAdapter:
                 last = exc
         raise AdapterError(f"{self.source} fetch failed: {last}")
 
+    def parse_search_page(self, html: str) -> list[VacancyResult]:
+        rows = sources.parse_search(self.source, html)
+        return [VacancyResult(source=self.source, external_id=row["external_id"], title=row["title"], url=row["url"], location=row.get("location", ""), raw=row) for row in rows]
+
+    def parse_detail_page(self, html: str, result: VacancyResult) -> VacancyResult:
+        detail = sources.parse_detail(self.source, html)
+        result.company = detail.get("company", "") or result.company
+        result.description = detail.get("description", "") or result.description
+        result.title = detail.get("title") or result.title
+        result.location = detail.get("location", "") or result.location
+        result.raw = {**(result.raw or {}), **detail}
+        return result
+
     def search(self, query: str, preferences: dict) -> list[VacancyResult]:
         results = []
         max_pages = max(1, min(3, self.settings.max_results_per_source))
         for page in range(max_pages):
             html = self._fetch(self.build_search_url(query, preferences, page))
-            rows = sources.parse_search(self.source, html)
+            rows = self.parse_search_page(html)
             if not rows:
                 break
             for row in rows:
-                results.append(VacancyResult(source=self.source, external_id=row["external_id"], title=row["title"], url=row["url"], raw=row))
+                results.append(row)
                 if len(results) >= self.settings.max_results_per_source:
                     return results
         return results
 
     def fetch_details(self, result: VacancyResult) -> VacancyResult:
-        html = self._fetch(result.url)
-        detail = sources.parse_detail(self.source, html)
-        result.company = detail.get("company", "")
-        result.description = detail.get("description", "")
-        result.title = detail.get("title") or result.title
-        result.raw = {**(result.raw or {}), **detail}
-        return result
+        return self.parse_detail_page(self._fetch(result.url), result)
 
     def normalize(self, raw: VacancyResult) -> dict:
         description = raw.description or ""
+        metadata = raw.raw or {}
         content_hash = hashlib.sha256(description.encode()).hexdigest() if description else None
-        return {"source": raw.source, "external_id": raw.external_id, "title": raw.title, "company": raw.company, "location": raw.location, "source_url": raw.url, "canonical_url": sources.normalize_url(raw.url), "description": description, "requirements": "", "responsibilities": "", "conditions": "", "skills": [], "raw_metadata": raw.raw or {}, "content_hash": content_hash}
+        return {
+            "source": raw.source,
+            "external_id": raw.external_id,
+            "title": raw.title,
+            "company": raw.company,
+            "location": raw.location,
+            "work_format": metadata.get("work_format", ""),
+            "employment_type": metadata.get("employment_type", ""),
+            "salary": metadata.get("salary"),
+            "published_at": metadata.get("published_at"),
+            "updated_at": metadata.get("updated_at"),
+            "source_url": raw.url,
+            "canonical_url": sources.normalize_url(raw.url),
+            "description": description,
+            "requirements": metadata.get("requirements", ""),
+            "responsibilities": metadata.get("responsibilities", ""),
+            "conditions": metadata.get("conditions", ""),
+            "skills": metadata.get("skills", []),
+            "raw_metadata": metadata,
+            "content_hash": content_hash,
+        }
