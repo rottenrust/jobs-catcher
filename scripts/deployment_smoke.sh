@@ -28,7 +28,8 @@ while [[ $# -gt 0 && ( "$1" == "-E" || "$1" == "-u" ) ]]; do
 done
 cmd=${1:-}; shift || true
 case "$cmd" in
-  useradd|chown|systemctl) exit 0 ;;
+  systemctl) echo "systemctl $*" >>"${SMOKE_SYSTEMCTL_LOG:-/dev/null}"; exit 0 ;;
+  useradd|chown) exit 0 ;;
   rsync)
     args=("$@")
     src="${args[-2]}"; dst="${args[-1]}"
@@ -45,6 +46,15 @@ SH
 chmod +x "$FAKE_BIN/sudo"
 cat >"$FAKE_BIN/curl" <<'SH'
 #!/usr/bin/env bash
+set -euo pipefail
+if [[ "${SMOKE_MUTATE_DB_ON_CURL:-0}" == "1" && -n "${SMOKE_DB_PATH:-}" ]]; then
+  python3 - "$SMOKE_DB_PATH" <<'PYDB'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+with con:
+    con.execute("update smoke_marker set value='bad'")
+PYDB
+fi
 if [[ "${FAKE_CURL_FAIL:-0}" == "1" ]]; then exit 22; fi
 exit 0
 SH
@@ -53,6 +63,29 @@ PATH="$FAKE_BIN:$PATH" APP_DIR="$APP_DIR" DATA_DIR="$DATA_DIR" ENV_FILE="$ENV_FI
 [[ -x "$APP_DIR/.venv/bin/python" ]]
 [[ -f "$DATA_DIR/jobs-catcher.sqlite3" ]]
 PATH="$FAKE_BIN:$PATH" APP_DIR="$APP_DIR" DATA_DIR="$DATA_DIR" ENV_FILE="$ENV_FILE" SYSTEMD_DIR="$SYSTEMD_DIR" APP_USER="$(id -un)" RUNTIME_USER="$(id -un)" SUDO="$FAKE_BIN/sudo" SKIP_GIT_PULL=1 bash "$APP_DIR/scripts/update.sh"
+DB_PATH="$DATA_DIR/jobs-catcher.sqlite3"
+"$APP_DIR/.venv/bin/python" - "$DB_PATH" <<'PYMARK'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+with con:
+    con.execute("create table if not exists smoke_marker (value text not null)")
+    con.execute("delete from smoke_marker")
+    con.execute("insert into smoke_marker(value) values ('good')")
+PYMARK
+OLD_SHA=$(git -C "$APP_DIR" rev-parse HEAD)
+set +e
+PATH="$FAKE_BIN:$PATH" APP_DIR="$APP_DIR" DATA_DIR="$DATA_DIR" ENV_FILE="$ENV_FILE" SYSTEMD_DIR="$SYSTEMD_DIR" APP_USER="$(id -un)" RUNTIME_USER="$(id -un)" SUDO="$FAKE_BIN/sudo" SKIP_GIT_PULL=1 FAKE_CURL_FAIL=1 SMOKE_MUTATE_DB_ON_CURL=1 SMOKE_DB_PATH="$DB_PATH" SMOKE_SYSTEMCTL_LOG="$ROOT/systemctl.log" bash "$APP_DIR/scripts/update.sh"
+FAILED_UPDATE=$?
+set -e
+[[ "$FAILED_UPDATE" -ne 0 ]]
+[[ "$(git -C "$APP_DIR" rev-parse HEAD)" == "$OLD_SHA" ]]
+grep -q "systemctl restart" "$ROOT/systemctl.log"
+"$APP_DIR/.venv/bin/python" - "$DB_PATH" <<'PYROLLBACK'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+value = con.execute("select value from smoke_marker").fetchone()[0]
+assert value == 'good', value
+PYROLLBACK
 DATA_DIR="$DATA_DIR" DATABASE_URL="sqlite:///$DATA_DIR/jobs-catcher.sqlite3" UPLOAD_DIR="$DATA_DIR/uploads" "$APP_DIR/.venv/bin/python" - <<'PYCHECK'
 from pathlib import Path
 from sqlalchemy import create_engine, text

@@ -27,13 +27,21 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 load_env
 
-run_as_runtime ./scripts/backup.sh "${DATABASE_URL#sqlite:///}"
+DB_PATH="${DATABASE_URL#sqlite:///}"
+BACKUP_PATH=$(run_as_runtime ./scripts/backup.sh "$DB_PATH")
 PREV=$(git rev-parse HEAD)
+PREV_REVISION=$(run_as_runtime .venv/bin/alembic -c alembic.ini current 2>/dev/null | awk '{print $1}' || true)
 rollback() {
+  trap - ERR
   echo "Health check failed; rolling back to $PREV" >&2
+  $SUDO systemctl stop jobs-catcher-web.service jobs-catcher-worker.service 2>/dev/null || true
   run_as_app git reset --hard "$PREV"
   run_as_app .venv/bin/python -m pip install -e .
-  run_as_runtime .venv/bin/alembic -c alembic.ini upgrade head
+  if [[ "${DATABASE_URL:-}" == sqlite:///* && -n "${BACKUP_PATH:-}" && -f "$BACKUP_PATH" ]]; then
+    run_as_runtime cp "$BACKUP_PATH" "$DB_PATH"
+  elif [[ -n "${PREV_REVISION:-}" ]]; then
+    run_as_runtime .venv/bin/alembic -c alembic.ini downgrade "$PREV_REVISION"
+  fi
   $SUDO systemctl restart jobs-catcher-web.service jobs-catcher-worker.service
 }
 trap rollback ERR
