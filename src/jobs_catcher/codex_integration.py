@@ -6,6 +6,12 @@ from .scoring import decision_for_score
 
 VACANCY_REQUIRED = {"vacancy_id", "score", "decision", "confidence", "role_summary", "matching_signals", "missing_signals", "red_flags", "applied_caps", "why_fits", "why_not_or_risks", "what_to_check_before_apply", "resume_angle", "cover_letter_points", "prescore_comment"}
 
+class CoverLetterTooLong(ValueError):
+    def __init__(self, text: str, max_chars: int) -> None:
+        super().__init__("cover letter is too long")
+        self.text = text
+        self.max_chars = max_chars
+
 PROFILE_SCHEMA_KEYS = {"professional_title", "experience", "companies", "roles", "periods", "responsibilities", "achievements", "projects", "skills", "technologies", "industries", "education", "languages", "strengths", "level", "directions", "facts_for_applications", "ambiguous", "confidence"}
 
 
@@ -64,7 +70,7 @@ def validate_cover_letter_result(result: dict, max_chars: int = 300) -> dict:
     if not text:
         raise ValueError("empty cover letter")
     if len(text) > max_chars:
-        raise ValueError("cover letter is too long")
+        raise CoverLetterTooLong(text, max_chars)
     return {"text": text}
 
 

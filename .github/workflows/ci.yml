@@ -26,5 +26,7 @@ jobs:
       - run: pytest
       - run: alembic -c alembic.ini upgrade head
       - run: alembic -c alembic.ini upgrade head
+      - run: bash -n scripts/install.sh scripts/update.sh scripts/backup.sh scripts/deployment_smoke.sh
+      - run: scripts/deployment_smoke.sh
       - run: python -m jobs_catcher.smoke
       - run: bash scripts/check-no-runtime-artifacts.sh

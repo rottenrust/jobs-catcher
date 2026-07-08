@@ -21,7 +21,7 @@ from .models import (
     UserSession, Vacancy, VacancyScore, VacancySource, VacancyUIState,
 )
 from .settings import Settings, load_settings
-from .worker import compute_next_run_at, validate_run_time, validate_timezone
+from .worker import compute_next_run_at, settings_from_db, validate_run_time, validate_timezone
 
 class Store:  # compatibility shim for old tests; production uses Settings/DB only.
     def __init__(self, database_url: str | None = None, upload_dir: Path | None = None, data_dir: Path | None = None):
@@ -89,6 +89,9 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
         value = csrf or request.headers.get("x-csrf-token") or request.query_params.get("csrf")
         if not auth.verify_csrf(token, value or ""):
             raise HTTPException(403, "CSRF")
+
+    def effective_settings(db: Session) -> Settings:
+        return settings_from_db(db, settings)
 
     def require_admin(db: Session, request: Request) -> tuple[User, str]:
         user, token = current_user(db, request)
@@ -231,7 +234,7 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
         with db_session() as db:
             user, token = current_user(db, request)
             profile = db.scalar(select(ProfileVersion).where(ProfileVersion.user_id == user.id).order_by(ProfileVersion.version.desc()))
-            body = escape(profile.data_json if profile else "{}")
+            body = profile.data_json if profile else "{}"
         return templates.TemplateResponse(request, "profile.html", {"title": "Profile", "csrf": auth.csrf_token(token), "profile": body})
 
     @app.get("/criteria", response_class=HTMLResponse)
@@ -239,7 +242,7 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
         with db_session() as db:
             user, token = current_user(db, request)
             row = db.scalar(select(CriteriaVersion).where(CriteriaVersion.user_id == user.id).order_by(CriteriaVersion.version.desc()))
-            body = escape(row.data_json if row else dumps(criteria.DEFAULT_CRITERIA))
+            body = row.data_json if row else dumps(criteria.DEFAULT_CRITERIA)
         return templates.TemplateResponse(request, "criteria.html", {"title": "Criteria", "csrf": auth.csrf_token(token), "criteria_text": body})
 
     @app.get("/schedule", response_class=HTMLResponse)
@@ -247,23 +250,47 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
         with db_session() as db:
             user, token = current_user(db, request)
             sched = db.scalar(select(UserSchedule).where(UserSchedule.user_id == user.id))
-        interval = sched.interval_days if sched else settings.min_schedule_interval_days
-        sources = ",".join(loads(sched.sources_json, list(settings.enabled_sources)) if sched else settings.enabled_sources)
+        with db_session() as db:
+            eff = effective_settings(db)
+        interval = sched.interval_days if sched else eff.min_schedule_interval_days
+        sources = ",".join(loads(sched.sources_json, list(eff.enabled_sources)) if sched else eff.enabled_sources)
         run_time = sched.run_time if sched else "09:00"
         tz = sched.timezone if sched else "Europe/Moscow"
         return templates.TemplateResponse(request, "schedule.html", {"title": "Schedule", "csrf": auth.csrf_token(token), "interval_days": interval, "sources": sources, "run_time": run_time, "timezone": tz})
 
-    @app.post("/admin/users")
-    def create_user(request: Request, login: str = Form(...), password: str = Form(...), display_name: str = Form("")):
+    @app.get("/admin/users", response_class=HTMLResponse)
+    def admin_users(request: Request):
         with db_session() as db:
-            admin, token = require_admin(db, request); require_csrf(request, token); auth.validate_password(login, password)
+            _admin, token = require_admin(db, request)
+            users = db.scalars(select(User).where(User.deleted_at.is_(None)).order_by(User.id)).all()
+        return templates.TemplateResponse(request, "admin_users.html", {"title":"Users", "csrf": auth.csrf_token(token), "users": users})
+
+    @app.post("/admin/users")
+    def create_user(request: Request, login: str = Form(...), password: str = Form(...), display_name: str = Form(""), csrf: str | None = Form(None)):
+        with db_session() as db:
+            admin, token = require_admin(db, request); require_csrf(request, token, csrf); auth.validate_password(login, password)
             user = User(login=login, password_hash=auth.hash_password(password), role="user", display_name=display_name or None, must_change_password=True)
-            db.add(user); db.flush(); audit(db, "user_created", admin.id, user.id, request); db.commit(); return {"id": user.id}
+            db.add(user)
+            try:
+                db.flush()
+            except IntegrityError as exc:
+                raise HTTPException(409, "duplicate login") from exc
+            audit(db, "user_created", admin.id, user.id, request); db.commit()
+            if request.headers.get("accept", "").find("text/html") >= 0:
+                return RedirectResponse("/admin/users", status_code=303)
+            return {"id": user.id}
+
+    @app.post("/admin/users/{uid}/delete")
+    def delete_user_form(uid: int, request: Request, csrf: str | None = Form(None)):
+        return _delete_user(uid, request, csrf, redirect=True)
 
     @app.delete("/admin/users/{uid}")
     def delete_user(uid: int, request: Request):
+        return _delete_user(uid, request, None, redirect=False)
+
+    def _delete_user(uid: int, request: Request, csrf: str | None, redirect: bool):
         with db_session() as db:
-            admin, token = require_admin(db, request); require_csrf(request, token)
+            admin, token = require_admin(db, request); require_csrf(request, token, csrf)
             user = db.get(User, uid)
             if not user or user.deleted_at is not None: raise HTTPException(404)
             files = [Path(r.path) for r in db.scalars(select(ResumeFile).where(ResumeFile.user_id == uid)).all()]
@@ -275,6 +302,8 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             for path in files:
                 try: path.unlink(missing_ok=True)
                 except Exception: pass
+            if redirect:
+                return RedirectResponse("/admin/users", status_code=303)
             return {"deleted": uid}
 
     @app.post("/resume")
@@ -321,6 +350,24 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             pv = ProfileVersion(user_id=user.id, resume_file_id=latest.resume_file_id if latest else None, version=version, data_json=dumps(profile), confirmed=False)
             db.add(pv); audit(db, "onboarding_saved", user.id, user.id, request); db.commit(); return profile
 
+
+    @app.post("/profile")
+    def save_profile(request: Request, profile: str = Form(...), csrf: str | None = Form(None)):
+        with db_session() as db:
+            user, token = current_user(db, request); require_csrf(request, token, csrf)
+            try:
+                payload = json.loads(profile)
+                if not isinstance(payload, dict):
+                    raise ValueError("profile must be object")
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            latest = db.scalar(select(ProfileVersion).where(ProfileVersion.user_id == user.id).order_by(ProfileVersion.version.desc()))
+            version = (latest.version if latest else 0) + 1
+            db.add(ProfileVersion(user_id=user.id, resume_file_id=latest.resume_file_id if latest else None, version=version, data_json=dumps(payload), confirmed=False))
+            audit(db, "profile_changed", user.id, user.id, request, version=version)
+            db.commit()
+            return RedirectResponse("/profile", status_code=303)
+
     @app.post("/profile/confirm")
     def confirm_profile(request: Request, csrf: str | None = Form(None)):
         with db_session() as db:
@@ -366,8 +413,9 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
                 validate_run_time(run_time); validate_timezone(timezone)
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
-            if interval_days < settings.min_schedule_interval_days or interval_days > settings.max_schedule_interval_days: raise HTTPException(400)
-            selected = [s.strip() for s in sources.split(",") if s.strip() and s.strip() in settings.enabled_sources]
+            eff = effective_settings(db)
+            if interval_days < eff.min_schedule_interval_days or interval_days > eff.max_schedule_interval_days: raise HTTPException(400)
+            selected = [s.strip() for s in sources.split(",") if s.strip() and s.strip() in eff.enabled_sources]
             if not selected: raise HTTPException(400, "no enabled sources selected")
             sched = db.scalar(select(UserSchedule).where(UserSchedule.user_id == user.id))
             if not sched:
@@ -401,7 +449,8 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
             state.viewed_at = utcnow(); db.commit()
             rec = loads(score.recommendations_json)
             _, token = current_user(db, request)
-            return templates.TemplateResponse(request, "vacancy_detail.html", {"title": v.title, "vacancy": v, "recommendations": rec, "csrf": auth.csrf_token(token)})
+            letters = db.scalars(select(CoverLetter).where(CoverLetter.user_id == user.id, CoverLetter.vacancy_id == vid).order_by(CoverLetter.version.desc())).all()
+            return templates.TemplateResponse(request, "vacancy_detail.html", {"title": v.title, "vacancy": v, "score": score, "recommendations": rec, "letters": letters, "csrf": auth.csrf_token(token)})
 
     @app.get("/export", response_class=PlainTextResponse)
     def export_text(request: Request):
@@ -452,19 +501,20 @@ def create_app(store: Store | None = None, *, settings: Settings | None = None, 
         with db_session() as db:
             _, token = require_admin(db, request)
             values = {row.key: loads(row.value_json) for row in db.scalars(select(AppSetting)).all()}
-        enabled = ",".join(values.get("enabled_sources", list(settings.enabled_sources)))
-        min_interval = values.get("min_schedule_interval_days", settings.min_schedule_interval_days)
-        max_results = values.get("max_results_per_source", settings.max_results_per_source)
-        return templates.TemplateResponse(request, "admin_settings.html", {"title": "Admin Settings", "csrf": auth.csrf_token(token), "enabled_sources": enabled, "min_schedule_interval_days": min_interval, "max_results_per_source": max_results})
+            eff = effective_settings(db)
+        enabled = ",".join(values.get("enabled_sources", list(eff.enabled_sources)))
+        context = {key: getattr(eff, key) for key in ["min_schedule_interval_days","max_schedule_interval_days","http_delay_seconds","http_jitter_seconds","http_timeout_seconds","http_retries","max_search_queries","max_results_per_source","max_vacancies_per_run","max_llm_candidates","codex_batch_size","codex_bin","resume_size_limit","artifact_retention_days","global_search_enabled"]}
+        context.update({"title": "Admin Settings", "csrf": auth.csrf_token(token), "enabled_sources": enabled})
+        return templates.TemplateResponse(request, "admin_settings.html", context)
 
     @app.post("/admin/settings")
-    def save_admin_settings(request: Request, enabled_sources: str = Form(""), min_schedule_interval_days: int = Form(1), max_results_per_source: int = Form(20), csrf: str | None = Form(None)):
+    def save_admin_settings(request: Request, enabled_sources: str = Form(""), min_schedule_interval_days: int = Form(1), max_schedule_interval_days: int = Form(30), timezone: str = Form("Europe/Moscow"), http_delay_seconds: float = Form(1.0), http_jitter_seconds: float = Form(0.5), http_timeout_seconds: float = Form(15.0), http_retries: int = Form(2), max_search_queries: int = Form(8), max_results_per_source: int = Form(20), max_vacancies_per_run: int = Form(100), max_llm_candidates: int = Form(25), codex_batch_size: int = Form(10), codex_bin: str = Form("codex"), resume_size_limit: int = Form(10485760), artifact_retention_days: int = Form(30), global_search_enabled: str | None = Form(None), csrf: str | None = Form(None)):
         with db_session() as db:
             admin, token = require_admin(db, request); require_csrf(request, token, csrf)
             selected = [src.strip() for src in enabled_sources.split(",") if src.strip() in {"hh", "habr", "superjob", "rabota", "geekjob", "getmatch"}]
-            if not selected or min_schedule_interval_days < 1 or max_results_per_source < 1:
+            if not selected or min_schedule_interval_days < 1 or max_results_per_source < 1 or max_schedule_interval_days < min_schedule_interval_days:
                 raise HTTPException(400)
-            payload = {"enabled_sources": selected, "min_schedule_interval_days": min_schedule_interval_days, "max_results_per_source": max_results_per_source}
+            payload = {"enabled_sources": selected, "min_schedule_interval_days": min_schedule_interval_days, "max_schedule_interval_days": max_schedule_interval_days, "timezone": timezone, "http_delay_seconds": http_delay_seconds, "http_jitter_seconds": http_jitter_seconds, "http_timeout_seconds": http_timeout_seconds, "http_retries": http_retries, "max_search_queries": max_search_queries, "max_results_per_source": max_results_per_source, "max_vacancies_per_run": max_vacancies_per_run, "max_llm_candidates": max_llm_candidates, "codex_batch_size": codex_batch_size, "codex_bin": codex_bin, "resume_size_limit": resume_size_limit, "artifact_retention_days": artifact_retention_days, "global_search_enabled": bool(global_search_enabled)}
             for key, value in payload.items():
                 row = db.get(AppSetting, key) or AppSetting(key=key, value_json="null")
                 row.value_json = dumps(value); row.updated_at = utcnow(); db.add(row)

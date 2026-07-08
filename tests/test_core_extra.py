@@ -25,7 +25,7 @@ scoring: {max_score: 22, positive_rules: [], red_flag_rules: [], hard_reject_rul
 output: {language: ru, cover_letter_max_chars: 300}
 """
     loaded=criteria.load_criteria(y,'.yaml')
-    assert criteria.validate_criteria(loaded)["name"] == "Test"
+    with pytest.raises(ValueError): criteria.validate_criteria(loaded)
     bad=criteria.DEFAULT_CRITERIA.copy(); bad["scoring"]={**criteria.DEFAULT_CRITERIA["scoring"], "decision_thresholds":[{"decision":"Мимо","min_score":0},{"decision":"Откликаться","min_score":16}]}
     with pytest.raises(ValueError): criteria.validate_criteria(bad)
     missing={"schema_version":1}

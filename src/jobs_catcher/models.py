@@ -157,6 +157,16 @@ class Vacancy(Base):
     company: Mapped[str] = mapped_column(String(500), default="", nullable=False)
     location: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    work_format: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    employment_type: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    salary_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    published_at: Mapped[str] = mapped_column(String(40), default="", nullable=False)
+    updated_at: Mapped[str] = mapped_column(String(40), default="", nullable=False)
+    requirements: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    responsibilities: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    conditions: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    skills_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    normalized_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 class VacancySource(Base):

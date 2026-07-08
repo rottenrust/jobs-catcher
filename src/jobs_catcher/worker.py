@@ -34,7 +34,7 @@ SETTINGS_KEYS = {
     "http_delay_seconds", "http_jitter_seconds", "http_timeout_seconds",
     "http_retries", "max_search_queries", "max_results_per_source",
     "max_vacancies_per_run", "max_llm_candidates", "codex_batch_size",
-    "resume_size_limit", "artifact_retention_days", "global_search_enabled",
+    "resume_size_limit", "artifact_retention_days", "global_search_enabled", "codex_bin",
 }
 
 def settings_from_db(db: Session, base: Settings) -> Settings:
@@ -83,6 +83,7 @@ class CodexRunner:
         self.settings = settings
         self.subprocess_run = subprocess_run
     def run(self, scenario: str, prompt: str, validator, run_dir: Path) -> dict:
+        run_dir.mkdir(parents=True, exist_ok=True)
         cmd = codex_integration.codex_command(self.settings.codex_bin, str(run_dir))
         return codex_integration.run_json_with_retry(self.subprocess_run, cmd, prompt, validator, timeout=180)
 
@@ -184,7 +185,15 @@ def _upsert_vacancy(db: Session, item: dict) -> Vacancy:
         existing = db.scalar(select(Vacancy).where(Vacancy.normalized_title == norm_title, Vacancy.normalized_company == norm_company, Vacancy.normalized_location == norm_loc, Vacancy.content_hash == content_hash))
     if existing:
         return existing
-    v = Vacancy(normalized_title=norm_title, normalized_company=norm_company, normalized_location=norm_loc, canonical_url=item.get("canonical_url"), content_hash=content_hash, title=item.get("title",""), company=item.get("company",""), location=item.get("location",""), description=item.get("description", ""))
+    v = Vacancy(
+        normalized_title=norm_title, normalized_company=norm_company, normalized_location=norm_loc,
+        canonical_url=item.get("canonical_url"), content_hash=content_hash, title=item.get("title",""),
+        company=item.get("company",""), location=item.get("location",""), description=item.get("description", ""),
+        work_format=item.get("work_format") or "", employment_type=item.get("employment_type") or "",
+        salary_json=dumps(item.get("salary") or {}), published_at=item.get("published_at") or "", updated_at=item.get("updated_at") or "",
+        requirements=item.get("requirements") or "", responsibilities=item.get("responsibilities") or "", conditions=item.get("conditions") or "",
+        skills_json=dumps(item.get("skills") or []), normalized_json=dumps(item),
+    )
     db.add(v); db.flush(); return v
 
 
@@ -219,7 +228,7 @@ def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings,
                     vacancy = _upsert_vacancy(db, item)
                     src = db.scalar(select(VacancySource).where(VacancySource.source == source, VacancySource.external_id == item["external_id"]))
                     if not src:
-                        db.add(VacancySource(vacancy_id=vacancy.id, source=source, external_id=item["external_id"], source_url=item["source_url"], raw_json=dumps(item.get("raw_metadata", {}))))
+                        db.add(VacancySource(vacancy_id=vacancy.id, source=source, external_id=item["external_id"], source_url=item["source_url"], raw_json=dumps(item)))
                     if db.scalar(select(RunVacancy).where(RunVacancy.run_id == run.id, RunVacancy.vacancy_id == vacancy.id)):
                         continue
                     db.add(RunVacancy(run_id=run.id, vacancy_id=vacancy.id, has_full_description=bool(vacancy.description)))
@@ -234,19 +243,27 @@ def handle_scheduled_search(db: Session, job: BackgroundJob, settings: Settings,
             health = db.scalar(select(SourceHealth).where(SourceHealth.source == source)) or SourceHealth(source=source, status="error")
             health.status="error"; health.last_error=str(exc); db.add(health)
     avg = scoring.run_average(scores, user_id=job.user_id, run_id=run.id); run.average_prescore = avg
-    candidates = scoring.codex_candidates(scores, user_id=job.user_id, run_id=run.id)[:min(settings.max_llm_candidates, settings.codex_batch_size)]
-    outputs=[]
-    for vacancy_id in candidates:
-        score = db.scalar(select(VacancyScore).where(VacancyScore.user_id == job.user_id, VacancyScore.run_id == run.id, VacancyScore.vacancy_id == vacancy_id))
-        vacancy = db.get(Vacancy, vacancy_id); pre = loads(score.signals_json)
-        prompt = codex_integration.build_vacancy_evaluation_prompt(profile_data, crit, {"id": str(vacancy.id), "title": vacancy.title, "company": vacancy.company, "description": vacancy.description}, pre)
-        try:
-            result = runner.run("vacancy_evaluation", prompt, lambda data, vid=str(vacancy.id): codex_integration.validate_codex_result(data, vid, crit), settings.run_dir / f"run-{run.id}")
-            score.final_score = result["score"]; score.decision = result["decision"]; score.recommendations_json = dumps(result); outputs.append(result)
-        except Exception as exc:
-            errors.append({"vacancy_id":vacancy_id,"error":str(exc)})
+    candidates = scoring.codex_candidates(scores, user_id=job.user_id, run_id=run.id)[:settings.max_llm_candidates]
+    outputs=[]; llm_inputs=[]
+    run_dir = settings.run_dir / str(run.id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    batch_size = max(1, settings.codex_batch_size)
+    for start in range(0, len(candidates), batch_size):
+        for vacancy_id in candidates[start:start + batch_size]:
+            score = db.scalar(select(VacancyScore).where(VacancyScore.user_id == job.user_id, VacancyScore.run_id == run.id, VacancyScore.vacancy_id == vacancy_id))
+            vacancy = db.get(Vacancy, vacancy_id); pre = loads(score.signals_json)
+            vacancy_payload = {"id": str(vacancy.id), "title": vacancy.title, "company": vacancy.company, "location": vacancy.location, "description": vacancy.description, "work_format": vacancy.work_format, "employment_type": vacancy.employment_type, "salary": loads(vacancy.salary_json), "requirements": vacancy.requirements, "responsibilities": vacancy.responsibilities, "conditions": vacancy.conditions, "skills": loads(vacancy.skills_json, [])}
+            input_record = {"user_id": job.user_id, "run_id": run.id, "vacancy_id": vacancy.id, "profile_version_id": profile.id, "criteria_version_id": crit_v.id, "profile": profile_data, "criteria": crit, "vacancy": vacancy_payload, "deterministic_signals": pre}
+            llm_inputs.append(input_record)
+            prompt = codex_integration.build_vacancy_evaluation_prompt(profile_data, crit, vacancy_payload, pre)
+            try:
+                job.status="codex_scoring"; job.progress=min(95, 60 + int(35 * (len(outputs)+1) / max(1, len(candidates)))); db.flush()
+                result = runner.run("vacancy_evaluation", prompt, lambda data, vid=str(vacancy.id): codex_integration.validate_codex_result(data, vid, crit), run_dir)
+                score.final_score = result["score"]; score.decision = result["decision"]; score.recommendations_json = dumps(result); outputs.append(result)
+            except Exception as exc:
+                errors.append({"vacancy_id":vacancy_id,"error":str(exc)})
     run.status="completed"; run.finished_at=utcnow(); run.summary_json=dumps({"errors":errors,"candidates":candidates,"average_prescore":avg})
-    codex_integration.write_run_artifacts(settings.run_dir / str(run.id), [{"vacancy_id":x["vacancy_id"],"prescore":x["prescore"]} for x in scores if x["vacancy_id"] in candidates], outputs, errors, {"status":"completed","average_prescore":avg,"llm_candidates":len(candidates)})
+    codex_integration.write_run_artifacts(run_dir, llm_inputs, outputs, errors, {"status":"completed","average_prescore":avg,"llm_candidates":len(candidates)})
     if schedule:
         schedule.last_run_at=utcnow()
 
@@ -258,10 +275,8 @@ def handle_cover_letter(db: Session, job: BackgroundJob, settings: Settings, run
     run_dir = settings.run_dir / f"job-{job.id}"
     try:
         result=runner.run("cover_letter", prompt, codex_integration.validate_cover_letter_result, run_dir)
-    except ValueError as exc:
-        if "too long" not in str(exc):
-            raise
-        shorten_prompt = codex_integration.build_cover_letter_shortening_prompt(getattr(exc, "text", "") or prompt, 300)
+    except codex_integration.CoverLetterTooLong as exc:
+        shorten_prompt = codex_integration.build_cover_letter_shortening_prompt(exc.text, exc.max_chars)
         result=runner.run("cover_letter_shorten", shorten_prompt, codex_integration.validate_cover_letter_result, run_dir)
     latest=db.scalar(select(CoverLetter).where(CoverLetter.user_id==job.user_id, CoverLetter.vacancy_id==vacancy.id).order_by(CoverLetter.version.desc()))
     db.add(CoverLetter(user_id=job.user_id, vacancy_id=vacancy.id, version=(latest.version if latest else 0)+1, text=result["text"]))
