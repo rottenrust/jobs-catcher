@@ -20,8 +20,13 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
-DATABASE_URL="$DATABASE_URL" "$APP_DIR/.venv/bin/alembic" -c "$APP_DIR/alembic.ini" upgrade head
-"$APP_DIR/.venv/bin/python" - <<'PYCHECK'
+if [[ -x "$APP_DIR/.venv/bin/python" ]]; then
+  PYTHON_BIN="$APP_DIR/.venv/bin/python"
+else
+  PYTHON_BIN="${PYTHON_BIN:-python}"
+fi
+DATABASE_URL="$DATABASE_URL" "$PYTHON_BIN" -m alembic -c "$APP_DIR/alembic.ini" upgrade head
+"$PYTHON_BIN" - <<'PYCHECK'
 from pathlib import Path
 from sqlalchemy import create_engine, text
 import os
